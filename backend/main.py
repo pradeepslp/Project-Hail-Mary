@@ -1,0 +1,82 @@
+import json
+from datetime import datetime
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from backend.database.connection import init_db
+from backend.database.redis_client import init_redis, get_redis
+from backend.websocket.connection import manager
+from backend.api.routes import router as api_router
+from backend.simulator.engine import simulator
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("[Server] Starting Project Hail Mary API Core...")
+    await init_db()
+    await init_redis()
+    await simulator.log_event("INFO", "Mission Control digital twin simulation server started")
+    yield
+    # Shutdown
+    print("[Server] Shutting down simulation tasks...")
+    if simulator.running_task and not simulator.running_task.done():
+        simulator.running_task.cancel()
+    # Close Redis client connection
+    redis = await get_redis()
+    if hasattr(redis, "close"):
+        await redis.close()
+
+app = FastAPI(
+    title="Project Hail Mary API",
+    description="Digital Twin and Mission Simulation Foundation Engine",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware to allow the frontend dashboard to communicate
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount REST paths
+app.include_router(api_router)
+
+# WebSocket path for streaming dashboard data
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        # Fetch current simulator states
+        telemetry = simulator.get_telemetry_data()
+        mission = simulator.get_mission_info()
+
+        # Retrieve historic events from Redis to populate log console
+        redis = await get_redis()
+        events = await redis.lrange("hail_mary:events", 0, -1)
+        
+        # Send hydration packet
+        await websocket.send_json({
+            "type": "INIT",
+            "mission": mission.model_dump(),
+            "telemetry": telemetry.model_dump(),
+            "events": events or [],
+            "active_events": [
+                {k: v for k, v in ev.items() if k != "duration"} 
+                for ev in simulator.active_events
+            ]
+        })
+
+        # Maintain connection
+        while True:
+            # Disconnects are raised from receive_text
+            await websocket.receive_text()
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"[WS] Connection error: {e}")
+        manager.disconnect(websocket)
