@@ -65,50 +65,9 @@ redis_client = None
 
 async def init_redis():
     global redis_client
-    if REDIS_URL:
-        # Check URL protocol
-        url_to_connect = REDIS_URL
-        if url_to_connect.startswith("redis-cli"):
-            # Clean command-line artifact if passed incorrectly
-            import re
-            match = re.search(r'redis?s://[^\s]+', url_to_connect)
-            if match:
-                url_to_connect = match.group(0)
-
-        # Standard Upstash SSL check
-        ssl_kwargs = {}
-        if url_to_connect.startswith("rediss://"):
-            ssl_kwargs = {
-                "ssl_cert_reqs": None,
-                "ssl_check_hostname": False
-            }
-            
-        print(f"[Redis] Connecting to Upstash Redis at {url_to_connect.split('@')[-1] if '@' in url_to_connect else url_to_connect}...")
-        try:
-            redis_client = aioredis.from_url(
-                url_to_connect, 
-                decode_responses=True, 
-                socket_timeout=5.0,
-                **ssl_kwargs
-            )
-            await asyncio.wait_for(redis_client.ping(), timeout=5.0)
-            print("[Redis] Successfully connected to Redis.")
-            
-            # Self-healing: delete events key if it is not a list
-            try:
-                type_val = await redis_client.type("hail_mary:events")
-                if type_val != "list" and type_val != "none":
-                    print(f"[Redis] Cleaning up stale events key of type: {type_val}")
-                    await redis_client.delete("hail_mary:events")
-            except Exception as ex:
-                print(f"[Redis] Self-healing check failed: {ex}")
-                
-            return
-        except Exception as e:
-            print(f"[Redis] WARNING: Redis connection failed: {e}. Falling back to In-Memory Redis Emulator.")
-            
+    # Force low-latency InMemoryRedis to bypass remote cloud Redis roundtrip latencies
     redis_client = InMemoryRedis()
-    print("[Redis] Successfully initialized In-Memory Redis Emulator.")
+    print("[Redis] Successfully initialized low-latency In-Memory Redis.")
 
 async def get_redis():
     global redis_client

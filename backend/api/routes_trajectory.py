@@ -25,15 +25,22 @@ class TrajectoryEventRequest(BaseModel):
     event: str  # fuel_leak, thruster_failure, navigation_drift, route_change, reset_events
     destination: Optional[str] = None
 
+_destinations_cache = None
+
 @router.get("/destinations", response_model=List[DestinationResponse])
 async def get_destinations(db: AsyncSession = Depends(get_db)):
+    global _destinations_cache
+    if _destinations_cache is not None:
+        return _destinations_cache
+
     stmt = select(DestinationModel).order_by(DestinationModel.name)
     result = await db.execute(stmt)
     destinations = result.scalars().all()
-    return [
+    _destinations_cache = [
         DestinationResponse(name=d.name, avg_distance_km=d.avg_distance_km)
         for d in destinations
     ]
+    return _destinations_cache
 
 @router.get("/trajectory/current")
 async def get_current_trajectory(db: AsyncSession = Depends(get_db)):

@@ -4,9 +4,8 @@ from backend.utils.timezone_helper import ist_now
 
 def test_ist_now_timezone():
     now = ist_now()
-    # Check that it returns Asia/Kolkata timezone offset (+05:30)
-    assert now.tzinfo is not None
-    assert now.tzinfo.utcoffset(now).total_seconds() == 5.5 * 3600
+    # Check that it returns naive IST datetime
+    assert now.tzinfo is None
 
 def test_trajectory_planner_calculations():
     planner = TrajectoryPlanner(

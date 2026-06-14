@@ -336,11 +336,13 @@ export default function TestingCenterPanel({
   const [replayStepIndex, setReplayStepIndex] = useState<number>(0);
   const [isPlayingReplay, setIsPlayingReplay] = useState<boolean>(false);
 
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll chat stream
+  // Auto-scroll chat stream container directly
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
   }, [chatStream]);
 
   // WebSocket real-time listener
@@ -1799,7 +1801,7 @@ export default function TestingCenterPanel({
                   Crew Debate Channel
                 </span>
                 
-                <div className="flex-1 flex flex-col gap-2 overflow-y-auto">
+                <div ref={chatContainerRef} className="flex-1 flex flex-col gap-2 overflow-y-auto">
                   {chatStream.map((msg, i) => {
                     const isLast = i === chatStream.length - 1;
                     return (
@@ -1823,7 +1825,6 @@ export default function TestingCenterPanel({
                       Awaiting debate event trigger...
                     </span>
                   )}
-                  <div ref={chatEndRef} />
                 </div>
               </div>
 

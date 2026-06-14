@@ -624,7 +624,6 @@ ${memoryString}
         return;
       } catch (err) {
         console.warn("[CMI] Backend Gemini request failed, using offline mock fallback:", err);
-        setMessages(prev => prev.filter(m => m.id !== newAssistantMessageId));
         handleMockResponse();
         return;
       }
@@ -748,8 +747,6 @@ ${memoryString}
 
     } catch (err) {
       console.warn("[CMI] Streaming failed, using offline mock fallback:", err);
-      // Clean up failed stream UI
-      setMessages(prev => prev.filter(m => m.id !== newAssistantMessageId));
       handleMockResponse();
     }
   };

@@ -211,7 +211,7 @@ export default function AutonomousOpsCenter() {
   const [benchmarking, setBenchmarking] = useState<boolean>(false);
   const [overrideInProgress, setOverrideInProgress] = useState<string | null>(null);
 
-  const demoLogEndRef = useRef<HTMLDivElement>(null);
+  const demoLogContainerRef = useRef<HTMLDivElement>(null);
 
   // Setup WebSocket connection locally
   useEffect(() => {
@@ -275,84 +275,46 @@ export default function AutonomousOpsCenter() {
     };
   }, []);
 
-  // Fetch telemetry independent updates
+  // Fetch telemetry independent updates in parallel
   const fetchAllData = useCallback(async () => {
-    try {
+    const fetchers = [
       // 1. Latest Trajectory Plan
-      const planRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/plan/latest");
-      if (planRes.ok) {
-        const pData = await planRes.json();
-        setLatestPlan(pData);
-      }
-    } catch (e) {
-      console.error("Error fetching plan:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/plan/latest")
+        .then(res => res.ok ? res.json().then(setLatestPlan) : null)
+        .catch(e => console.error("Error fetching plan:", e)),
 
-    try {
       // 2. Timeline Checkpoints
-      const tlRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/timeline");
-      if (tlRes.ok) {
-        const tlData = await tlRes.json();
-        setTimeline(tlData);
-      }
-    } catch (e) {
-      console.error("Error fetching timeline:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/timeline")
+        .then(res => res.ok ? res.json().then(setTimeline) : null)
+        .catch(e => console.error("Error fetching timeline:", e)),
 
-    try {
       // 3. Strategy Scorecards
-      const stRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/strategies/compare");
-      if (stRes.ok) {
-        const stData = await stRes.json();
-        setStrategies(stData);
-      }
-    } catch (e) {
-      console.error("Error fetching strategies:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/strategies/compare")
+        .then(res => res.ok ? res.json().then(setStrategies) : null)
+        .catch(e => console.error("Error fetching strategies:", e)),
 
-    try {
       // 4. Horizon Forecasts
-      const fcRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/forecasts");
-      if (fcRes.ok) {
-        const fcData = await fcRes.json();
-        setForecasts(fcData);
-      }
-    } catch (e) {
-      console.error("Error fetching forecasts:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/forecasts")
+        .then(res => res.ok ? res.json().then(setForecasts) : null)
+        .catch(e => console.error("Error fetching forecasts:", e)),
 
-    try {
       // 5. Autonomy Traces
-      const trRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/explainable-autonomy");
-      if (trRes.ok) {
-        const trData = await trRes.json();
-        setAutonomyTraces(trData);
-      }
-    } catch (e) {
-      console.error("Error fetching traces:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/explainable-autonomy")
+        .then(res => res.ok ? res.json().then(setAutonomyTraces) : null)
+        .catch(e => console.error("Error fetching traces:", e)),
 
-    try {
       // 6. Agent Consensus Records
-      const csRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/consensus");
-      if (csRes.ok) {
-        const csData = await csRes.json();
-        setConsensusRecords(csData);
-      }
-    } catch (e) {
-      console.error("Error fetching consensus:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/consensus")
+        .then(res => res.ok ? res.json().then(setConsensusRecords) : null)
+        .catch(e => console.error("Error fetching consensus:", e)),
 
-    try {
       // 7. Autonomy Performance Metrics index
-      const idxRes = await fetch("http://127.0.0.1:8000/api/phase5/mission/autonomy-index");
-      if (idxRes.ok) {
-        const idxData = await idxRes.json();
-        setAutonomyIndex(idxData);
-      }
-    } catch (e) {
-      console.error("Error fetching autonomy index:", e);
-    }
+      fetch("http://127.0.0.1:8000/api/phase5/mission/autonomy-index")
+        .then(res => res.ok ? res.json().then(setAutonomyIndex) : null)
+        .catch(e => console.error("Error fetching autonomy index:", e))
+    ];
+
+    await Promise.allSettled(fetchers);
   }, []);
 
   // Poll for live metrics updates every 4 seconds to sync simulation state
@@ -366,8 +328,8 @@ export default function AutonomousOpsCenter() {
 
   // Scroll to bottom of demo log console when logs append
   useEffect(() => {
-    if (demoLogEndRef.current) {
-      demoLogEndRef.current.scrollIntoView({ behavior: "smooth" });
+    if (demoLogContainerRef.current) {
+      demoLogContainerRef.current.scrollTop = demoLogContainerRef.current.scrollHeight;
     }
   }, [demoLogs]);
 
@@ -459,20 +421,7 @@ export default function AutonomousOpsCenter() {
       payload_mass: payloadMass,
       mission_type: missionType
     };
-    // Send event API call for route change to align backend state
-    try {
-      await fetch("http://127.0.0.1:8000/api/trajectory/event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          event: "route_change",
-          destination: newDest
-        })
-      });
-    } catch (err) {
-      console.error("Failed to post route_change event:", err);
-    }
-    // Also perform immediate calculation
+    // Perform immediate trajectory calculation
     await handleCalculateTrajectory(undefined, targetInputs);
   };
 
@@ -862,7 +811,7 @@ export default function AutonomousOpsCenter() {
             <span className={`w-2 h-2 rounded-full shadow-md ${wsStatus === "connected" ? "bg-emerald-500 shadow-emerald-500/40" : "bg-rose-500 animate-pulse"}`} />
           </h2>
 
-          <div className="flex-1 overflow-y-auto max-h-[220px] p-3 rounded-lg border border-slate-900 bg-slate-950 font-mono text-[9px] text-cyan-500 leading-normal space-y-1">
+          <div ref={demoLogContainerRef} className="flex-1 overflow-y-auto max-h-[220px] p-3 rounded-lg border border-slate-900 bg-slate-950 font-mono text-[9px] text-cyan-500 leading-normal space-y-1">
             {demoLogs.length === 0 ? (
               <p className="text-slate-600 italic">Awaiting showcase activation telemetry feeds...</p>
             ) : (
@@ -883,7 +832,6 @@ export default function AutonomousOpsCenter() {
                 );
               })
             )}
-            <div ref={demoLogEndRef} />
           </div>
         </div>
 
