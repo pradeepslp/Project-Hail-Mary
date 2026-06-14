@@ -35,10 +35,12 @@ import {
 
 import { Telemetry, Mission, ActiveEvent, SubsystemInfo } from "../hooks/useWebSocket";
 
+import { useStore, telemetryStore, missionStore, activeEventsStore } from "../hooks/useStore";
+
 interface IntelligenceCenterProps {
-  telemetry: Telemetry | null;
-  mission: Mission | null;
-  activeEvents: ActiveEvent[];
+  telemetry?: Telemetry | null;
+  mission?: Mission | null;
+  activeEvents?: ActiveEvent[];
 }
 
 interface Objective {
@@ -65,10 +67,17 @@ interface Replay {
 }
 
 export default function IntelligenceCenter({
-  telemetry: liveTelemetry,
-  mission: liveMission,
-  activeEvents: liveActiveEvents
+  telemetry: liveTelemetryProp,
+  mission: liveMissionProp,
+  activeEvents: liveActiveEventsProp
 }: IntelligenceCenterProps) {
+  const storeTelemetry = useStore(telemetryStore);
+  const storeMission = useStore(missionStore);
+  const storeActiveEvents = useStore(activeEventsStore);
+
+  const liveTelemetry = liveTelemetryProp !== undefined ? liveTelemetryProp : storeTelemetry;
+  const liveMission = liveMissionProp !== undefined ? liveMissionProp : storeMission;
+  const liveActiveEvents = liveActiveEventsProp !== undefined ? liveActiveEventsProp : storeActiveEvents;
   // Config & API connection
   const backendUrl = "127.0.0.1:8000";
 

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { 
   Search, 
   Filter, 
@@ -15,16 +15,7 @@ import {
   Zap, 
   ShieldCheck 
 } from "lucide-react";
-import { Telemetry, Mission } from "../hooks/useWebSocket";
-
-interface ActiveEvent {
-  id: number;
-  event_type: string;
-  severity: string;
-  description: string;
-  affected_system: string;
-  recommended_actions: string;
-}
+import { useStore, missionStore, activeEventsStore } from "../hooks/useStore";
 
 interface HistoricalEvent {
   id: number;
@@ -39,19 +30,22 @@ interface HistoricalEvent {
   resolution_time: string | null;
 }
 
-interface EventDashboardProps {
-  telemetry: Telemetry | null;
-  mission: Mission | null;
-  activeEvents: ActiveEvent[];
-}
+export default function EventDashboard() {
+  const mission = useStore(missionStore);
+  const activeEvents = useStore(activeEventsStore);
 
-export default function EventDashboard({ telemetry, mission, activeEvents }: EventDashboardProps) {
   const [history, setHistory] = useState<HistoricalEvent[]>([]);
   const [search, setSearch] = useState("");
   const [severityFilter, setSeverityFilter] = useState("");
   const [systemFilter, setSystemFilter] = useState("");
   const [sortOrder, setSortOrder] = useState<"desc" | "asc">("desc");
   const [isLoading, setIsLoading] = useState(false);
+
+  // Virtualization state
+  const [scrollTop, setScrollTop] = useState(0);
+  const containerHeight = 220; // matches max-h-[220px]
+  const itemHeight = 54; // approximate height per row item in pixels
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   // Fetch Event History from API
   const fetchHistory = useCallback(async () => {
@@ -62,7 +56,7 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
       if (systemFilter) queryParams.append("system", systemFilter);
       if (search) queryParams.append("search", search);
       queryParams.append("sort", sortOrder);
-      queryParams.append("limit", "50");
+      queryParams.append("limit", "100"); // increased limit, virtualization will handle it
 
       const res = await fetch(`http://127.0.0.1:8000/events/history?${queryParams.toString()}`);
       if (res.ok) {
@@ -80,6 +74,11 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory, activeEvents]);
+
+  // Handle scroll for virtual windowing calculation
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  };
 
   // Translate severities to colors
   const getSeverityBadgeClass = (severity: string) => {
@@ -112,6 +111,15 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
     if (level === "MODERATE") return "text-amber-400 shadow-amber-400/30";
     return "text-cyan-400 shadow-cyan-500/30";
   };
+
+  // Virtualizer calculations
+  const totalHeight = history.length * itemHeight;
+  const startIndex = Math.max(0, Math.floor(scrollTop / itemHeight) - 2);
+  const endIndex = Math.min(history.length - 1, Math.floor((scrollTop + containerHeight) / itemHeight) + 2);
+  
+  const visibleHistory = history.slice(startIndex, endIndex + 1);
+  const paddingTop = startIndex * itemHeight;
+  const paddingBottom = Math.max(0, totalHeight - paddingTop - (visibleHistory.length * itemHeight));
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
@@ -283,7 +291,7 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
               >
                 <option value="">All Systems</option>
                 <option value="Propulsion">Propulsion</option>
-                <option value="Electrical Systems">Electrical</option>
+                <option value="Electrical Systems">Electrical Systems</option>
                 <option value="Communications">Communications</option>
                 <option value="Structural Armor">Structural Armor</option>
                 <option value="Nav Computers">Nav Computers</option>
@@ -300,8 +308,12 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
             </div>
           </div>
 
-          {/* Historical Log list */}
-          <div className="flex-1 overflow-y-auto max-h-[220px] scrollbar-thin scrollbar-thumb-slate-850 scrollbar-track-transparent">
+          {/* Historical Log list with Custom Virtual List windowing */}
+          <div 
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto max-h-[220px] scrollbar-thin scrollbar-thumb-slate-850 scrollbar-track-transparent"
+          >
             {isLoading ? (
               <div className="text-center font-mono text-[10px] text-slate-600 py-6">
                 Querying database records...
@@ -311,39 +323,51 @@ export default function EventDashboard({ telemetry, mission, activeEvents }: Eve
                 No logs matching filter configurations.
               </div>
             ) : (
-              <div className="space-y-1.5 pr-2 font-mono text-[10px]">
-                {history.map(item => (
-                  <div 
-                    key={item.id} 
-                    className="flex flex-col md:flex-row md:items-center justify-between gap-2 p-2 rounded border border-slate-900/60 bg-slate-950/40 hover:border-slate-800/80 transition-all duration-200"
-                  >
-                    <div className="flex items-start gap-2">
-                      <span className="text-slate-600">[{new Date(item.timestamp).toLocaleTimeString()}]</span>
-                      <span className={getSeverityBadgeClass(item.severity)}>{item.severity}</span>
-                      <div className="flex flex-col">
-                        <span className="font-bold text-slate-200 uppercase">{item.event_type}</span>
-                        <span className="text-slate-500 mt-0.5 leading-relaxed">{item.description}</span>
+              <div 
+                className="font-mono text-[10px] relative" 
+                style={{ height: `${totalHeight}px` }}
+              >
+                <div 
+                  style={{ 
+                    transform: `translateY(${paddingTop}px)`,
+                    paddingBottom: `${paddingBottom}px`
+                  }}
+                  className="space-y-1.5 pr-2"
+                >
+                  {visibleHistory.map(item => (
+                    <div 
+                      key={item.id} 
+                      style={{ height: `${itemHeight}px` }}
+                      className="flex flex-col md:flex-row md:items-center justify-between gap-2 p-2 rounded border border-slate-900/60 bg-slate-950/40 hover:border-slate-800/80 transition-all duration-200 overflow-hidden"
+                    >
+                      <div className="flex items-start gap-2 overflow-hidden">
+                        <span className="text-slate-600">[{new Date(item.timestamp).toLocaleTimeString()}]</span>
+                        <span className={getSeverityBadgeClass(item.severity)}>{item.severity}</span>
+                        <div className="flex flex-col overflow-hidden">
+                          <span className="font-bold text-slate-200 uppercase truncate">{item.event_type}</span>
+                          <span className="text-slate-500 mt-0.5 leading-relaxed truncate max-w-[450px]">{item.description}</span>
+                        </div>
+                      </div>
+                      
+                      <div className="flex items-center gap-3 self-end md:self-auto text-[9px] text-slate-500 whitespace-nowrap">
+                        <span>SYS: {item.affected_system}</span>
+                        <span className="flex items-center gap-1">
+                          {item.resolved ? (
+                            <>
+                              <CheckCircle className="w-3.5 h-3.5 text-emerald-500" />
+                              <span className="text-emerald-500 font-bold uppercase">RESOLVED</span>
+                            </>
+                          ) : (
+                            <>
+                              <AlertOctagon className="w-3.5 h-3.5 text-rose-500 animate-pulse" />
+                              <span className="text-rose-400 font-bold uppercase">ACTIVE</span>
+                            </>
+                          )}
+                        </span>
                       </div>
                     </div>
-                    
-                    <div className="flex items-center gap-3 self-end md:self-auto text-[9px] text-slate-500 whitespace-nowrap">
-                      <span>SYS: {item.affected_system}</span>
-                      <span className="flex items-center gap-1">
-                        {item.resolved ? (
-                          <>
-                            <CheckCircle className="w-3.5 h-3.5 text-emerald-500" />
-                            <span className="text-emerald-500 font-bold uppercase">RESOLVED</span>
-                          </>
-                        ) : (
-                          <>
-                            <AlertOctagon className="w-3.5 h-3.5 text-rose-500 animate-pulse" />
-                            <span className="text-rose-400 font-bold uppercase">ACTIVE</span>
-                          </>
-                        )}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             )}
           </div>

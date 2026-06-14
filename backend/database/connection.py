@@ -2,6 +2,7 @@ import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from backend.database.models import Base
 from dotenv import load_dotenv
+from backend.utils.timezone_helper import ist_now
 
 load_dotenv()
 
@@ -18,12 +19,31 @@ SessionLocal = None
 async def seed_db(session_maker):
     async with session_maker() as db:
         from sqlalchemy import select
+        import json
+        import os
         from backend.database.models import (
             MissionObjectiveModel, 
             EventDependencyModel, 
             ActionOptionModel, 
-            ActionPredictionModel
+            ActionPredictionModel,
+            DestinationModel
         )
+        
+        # 0. Seed destinations
+        try:
+            res_dest = await db.execute(select(DestinationModel).limit(1))
+            if res_dest.scalars().first() is None:
+                json_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "destinations.json")
+                if os.path.exists(json_path):
+                    with open(json_path, "r") as f:
+                        dest_data = json.load(f)
+                    for item in dest_data:
+                        dest = DestinationModel(name=item["name"], avg_distance_km=item["avg_distance_km"])
+                        db.add(dest)
+                    await db.commit()
+                    print(f"[DB] Seeded {len(dest_data)} destinations.")
+        except Exception as e:
+            print(f"[DB] Error seeding destinations: {e}")
         
         # Check if already seeded
         try:
@@ -123,6 +143,10 @@ async def init_db():
             engine = create_async_engine(
                 DATABASE_URL, 
                 echo=False,
+                pool_size=15,
+                max_overflow=25,
+                pool_recycle=1800,
+                pool_timeout=30,
                 pool_pre_ping=True
             )
             async with engine.begin() as conn:
@@ -154,3 +178,55 @@ async def get_db():
         except Exception:
             await session.rollback()
             raise
+
+
+async def clear_transaction_tables(db):
+    from sqlalchemy import delete, update
+    from backend.database.models import (
+        EventModel,
+        MissionEventModel,
+        AgentDecisionModel,
+        AgentReasoningModel,
+        AgentMemoryModel,
+        AgentConfidenceModel,
+        AgentMetricsModel,
+        AgentCollaborationModel,
+        ConsensusRecordModel,
+        RecoveryActionModel,
+        ContingencyPlanModel,
+        MissionMemoryModel,
+        RiskHistoryModel,
+        SubsystemHealthModel,
+        MaintenanceForecastModel,
+        ForecastResultModel,
+        MissionTimelineModel
+    )
+    tables = [
+        EventModel,
+        MissionEventModel,
+        AgentDecisionModel,
+        AgentReasoningModel,
+        AgentMemoryModel,
+        AgentConfidenceModel,
+        AgentMetricsModel,
+        AgentCollaborationModel,
+        ConsensusRecordModel,
+        RecoveryActionModel,
+        ContingencyPlanModel,
+        MissionMemoryModel,
+        RiskHistoryModel,
+        SubsystemHealthModel,
+        MaintenanceForecastModel,
+        ForecastResultModel
+    ]
+    for table in tables:
+        try:
+            await db.execute(delete(table))
+        except Exception as e:
+            print(f"[DB] Error clearing table {table.__tablename__}: {e}")
+            
+    try:
+        await db.execute(update(MissionTimelineModel).values(status="PENDING"))
+    except Exception as e:
+        print(f"[DB] Error resetting timeline status: {e}")
+

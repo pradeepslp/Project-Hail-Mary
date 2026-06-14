@@ -3,6 +3,7 @@ import json
 import asyncio
 from dotenv import load_dotenv
 import redis.asyncio as aioredis
+from backend.utils.timezone_helper import ist_now
 
 load_dotenv()
 

@@ -1,4 +1,17 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback } from "react";
+import { 
+  telemetryStore, 
+  missionStore, 
+  activeEventsStore, 
+  eventsStore, 
+  statusStore, 
+  useStore, 
+  resetAllStores,
+  missionSuccessStore,
+  missionFailureStore
+} from "./useStore";
+import { agentVoiceService } from "./useAgentVoice";
+
 
 export interface SubsystemInfo {
   health: number;
@@ -24,6 +37,24 @@ export interface Telemetry {
   success_probability?: number;
   failure_probability?: number;
   confidence_score?: number;
+  eta?: string;
+  main_fuel_pct?: number;
+  backup_fuel_pct?: number;
+  emergency_fuel_pct?: number;
+  simulation_speed?: string;
+  mission_elapsed?: string;
+  distance_remaining?: string;
+  fuel_required?: number;
+  travel_time_h?: number;
+  feasibility?: boolean;
+  main_fuel_mass?: number;
+  backup_fuel_mass?: number;
+  emergency_fuel_mass?: number;
+  total_fuel_mass?: number;
+  trajectory_distance?: number;
+  burn_rate?: number;
+  fuel_consumed?: number;
+  acceleration?: number;
 }
 
 export interface Mission {
@@ -54,11 +85,11 @@ export interface ActiveEvent {
 
 
 export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
-  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
-  const [mission, setMission] = useState<Mission | null>(null);
-  const [events, setEvents] = useState<string[]>([]);
-  const [activeEvents, setActiveEvents] = useState<ActiveEvent[]>([]);
-  const [status, setStatus] = useState<"connecting" | "connected" | "disconnected">("disconnected");
+  const telemetry = useStore(telemetryStore);
+  const mission = useStore(missionStore);
+  const events = useStore(eventsStore);
+  const activeEvents = useStore(activeEventsStore);
+  const status = useStore(statusStore);
   
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -66,7 +97,7 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
   const connect = useCallback(() => {
     if (wsRef.current) return;
 
-    setStatus("connecting");
+    statusStore.setState("connecting");
     const wsUrl = `ws://${backendUrl}/ws`;
     
     console.log(`[WS] Connecting to ${wsUrl}...`);
@@ -74,7 +105,7 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
     wsRef.current = socket;
 
     socket.onopen = () => {
-      setStatus("connected");
+      statusStore.setState("connected");
       console.log("[WS] Connection established.");
     };
 
@@ -82,25 +113,43 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
       try {
         const data = JSON.parse(event.data);
         if (data.type === "INIT") {
-          setTelemetry(data.telemetry);
-          setMission(data.mission);
-          setEvents(data.events || []);
-          setActiveEvents(data.active_events || []);
-        } else if (data.type === "TELEMETRY") {
-          setTelemetry(data.telemetry);
-          setMission(data.mission);
-          if (data.active_events) {
-            setActiveEvents(data.active_events);
+          telemetryStore.setState(data.telemetry);
+          missionStore.setState(data.mission);
+          eventsStore.setState(data.events || []);
+          activeEventsStore.setState(data.active_events || []);
+        } else if (data.type === "TELEMETRY" || data.type === "TELEMETRY_TICK") {
+          telemetryStore.setState(data.telemetry);
+          if (data.mission) {
+            missionStore.setState(data.mission);
           }
+          if (data.active_events) {
+            activeEventsStore.setState(data.active_events);
+          }
+        } else if (data.type === "MISSION_STATE") {
+          missionStore.setState(data.mission);
+        } else if (data.type === "ACTIVE_EVENTS") {
+          activeEventsStore.setState(data.active_events);
         } else if (data.type === "EVENT") {
-          setEvents((prev) => [...prev, data.message]);
+          eventsStore.setState((prev) => [...prev, data.message]);
         } else if (data.type === "NEW_EVENT") {
-          setActiveEvents((prev) => {
+          activeEventsStore.setState((prev) => {
             if (prev.some(e => e.id === data.event.id)) return prev;
             return [...prev, data.event];
           });
         } else if (data.type === "EVENT_RESOLVED") {
-          setActiveEvents((prev) => prev.filter(e => e.id !== data.event_id));
+          activeEventsStore.setState((prev) => prev.filter(e => e.id !== data.event_id));
+        } else if (data.type === "MISSION_SUCCESS") {
+          missionSuccessStore.setState(data.data);
+        } else if (data.type === "MISSION_FAILED") {
+          missionFailureStore.setState(data.data);
+        } else if (data.type === "AGENT_ANALYSIS_STARTED") {
+          agentVoiceService.speak("Mission Commander Agent", `Attention. Anomaly detected: ${data.event_type}. Convoking agent specialists to evaluate mitigation strategies.`);
+        } else if (data.type === "AGENT_RECOMMENDATION_CREATED") {
+          const timestamp = new Date().toLocaleTimeString();
+          const logMsg = `[RECOMMENDATION] [${timestamp}] ${data.agent_name}: ${data.reasoning}`;
+          eventsStore.setState((prev) => [...prev, logMsg]);
+        } else if (data.type === "COMMANDER_DECISION_CREATED") {
+          agentVoiceService.speak("Mission Commander Agent", data.reasoning);
         }
       } catch (err) {
         console.error("[WS] Error parsing message:", err);
@@ -108,7 +157,7 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
     };
 
     socket.onclose = () => {
-      setStatus("disconnected");
+      statusStore.setState("disconnected");
       wsRef.current = null;
       console.log("[WS] Connection closed. Attempting reconnect in 3s...");
       reconnectTimeoutRef.current = setTimeout(() => {
@@ -117,7 +166,7 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
     };
 
     socket.onerror = (error) => {
-      console.error("[WS] Error:", error);
+      console.warn("[WS] Socket error occurred. Reconnecting...");
       socket.close();
     };
   }, [backendUrl]);
@@ -137,6 +186,8 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
   // REST API Actions
   const startMission = async () => {
     try {
+      missionSuccessStore.setState(null);
+      missionFailureStore.setState(null);
       const res = await fetch(`http://${backendUrl}/start-mission`, { method: "POST" });
       return await res.json();
     } catch (err) {
@@ -155,8 +206,9 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
 
   const resetMission = async () => {
     try {
+      // Optimistic UI updates - clear instantly
+      resetAllStores();
       const res = await fetch(`http://${backendUrl}/reset-mission`, { method: "POST" });
-      setEvents([]);
       return await res.json();
     } catch (err) {
       console.error("[API] Error resetting mission:", err);
@@ -174,3 +226,4 @@ export const useWebSocket = (backendUrl: string = "127.0.0.1:8000") => {
     resetMission,
   };
 };
+

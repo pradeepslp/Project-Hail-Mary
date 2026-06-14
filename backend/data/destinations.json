@@ -1,0 +1,38 @@
+[
+  {
+    "name": "Moon",
+    "avg_distance_km": 384400.0
+  },
+  {
+    "name": "Venus",
+    "avg_distance_km": 41400000.0
+  },
+  {
+    "name": "Mercury",
+    "avg_distance_km": 91691000.0
+  },
+  {
+    "name": "Mars",
+    "avg_distance_km": 225300000.0
+  },
+  {
+    "name": "Jupiter",
+    "avg_distance_km": 628730000.0
+  },
+  {
+    "name": "Saturn",
+    "avg_distance_km": 1275000000.0
+  },
+  {
+    "name": "Uranus",
+    "avg_distance_km": 2720000000.0
+  },
+  {
+    "name": "Neptune",
+    "avg_distance_km": 4350000000.0
+  },
+  {
+    "name": "Tau Ceti e",
+    "avg_distance_km": 112600000000000.0
+  }
+]

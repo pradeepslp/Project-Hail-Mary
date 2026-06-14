@@ -3,7 +3,18 @@ import json
 import random
 import math
 import asyncio
-from datetime import datetime
+from datetime import datetime as _datetime, timedelta
+from backend.utils.timezone_helper import ist_now
+
+class datetime(_datetime):
+    @classmethod
+    def utcnow(cls):
+        return ist_now()
+
+    @classmethod
+    def now(cls, tz=None):
+        return ist_now()
+
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +35,9 @@ from backend.database.models import (
     ActionPredictionModel,
     MissionMemoryModel,
     MissionReplayModel,
-    MonteCarloResultModel
+    MonteCarloResultModel,
+    MissionExperienceModel,
+    AutonomyMetricsModel
 )
 from backend.database.redis_client import get_redis
 from backend.websocket.connection import manager
@@ -45,6 +58,12 @@ class EventSchema(BaseModel):
 class TelemetryData(BaseModel):
     timestamp: str
     fuel: float
+    main_fuel_pct: float = 100.0
+    backup_fuel_pct: float = 100.0
+    emergency_fuel_pct: float = 100.0
+    simulation_speed: str = "1X"
+    mission_elapsed: str = "0 Days"
+    distance_remaining: str = "0 km"
     power: float
     oxygen: float
     temperature: float
@@ -60,6 +79,17 @@ class TelemetryData(BaseModel):
     success_probability: float
     failure_probability: float
     confidence_score: float
+    eta: Optional[str] = "N/A"
+    fuel_required: float = 0.0
+    travel_time_h: float = 0.0
+    feasibility: bool = True
+    main_fuel_mass: float = 0.0
+    backup_fuel_mass: float = 0.0
+    emergency_fuel_mass: float = 0.0
+    total_fuel_mass: float = 0.0
+    burn_rate: float = 0.0
+    fuel_consumed: float = 0.0
+    acceleration: float = 0.0
 
 class MissionInfo(BaseModel):
     name: str
@@ -131,20 +161,9 @@ def run_monte_carlo_blocking(start_state: Dict[str, Any], iterations: int) -> Di
             oxygen_rate = 0.05 * diff_factor
             oxygen = max(0.0, oxygen - oxygen_rate * step_dt * (2.0 - (subsystems["Life Support"] / 100.0)))
             
-            # Spawn random event check rolls (35% probability at intervals)
-            if ticks % int(start_state.get("event_frequency", 30)) == 0:
-                if random.random() < 0.35:
-                    et = random.choice([
-                        "Solar Storm", "Fuel Leak", "Thruster Failure", "Communication Loss",
-                        "Radiation Burst", "Sensor Malfunction", "Power Fluctuation",
-                        "Navigation Drift", "Micrometeorite Impact"
-                    ])
-                    if not any(e["event_type"] == et for e in active_events):
-                        active_events.append({
-                            "event_type": et,
-                            "duration": random.uniform(15.0, 45.0),
-                            "status": "ACTIVE"
-                        })
+            # DISABLED: Automatic event generation removed.
+            # Anomalies are only created via manual user injection.
+            pass
             
             # Subsystem decay impact multipliers
             has_comm_fail = False
@@ -284,6 +303,61 @@ class SpacecraftSimulator:
     def __init__(self):
         self.difficulty = "Normal"
         self.event_frequency = 30.0
+        self.autonomy_level = 0
+        self.agent_workflow_running = False
+        
+        self.anomaly_templates = {
+            # Environmental
+            "Solar Storm": {"affected_system": "Power", "desc": "Solar CME storm. Inducing massive electromagnetic charges.", "action": "Retract Panels & Divert Power to Deflectors", "multipliers": {"power": -1.5, "subsystems.Power": -2.0, "subsystems.Communication": -2.5}},
+            "Radiation Burst": {"affected_system": "Life Support", "desc": "High alpha particles count. Life support systems under stress.", "action": "Activate Carbon Shielding", "multipliers": {"oxygen": -0.5, "subsystems.Life Support": -1.5, "subsystems.Science Systems": -1.2}},
+            "Asteroid Field": {"affected_system": "Thermal Control", "desc": "Entering debris dense zone. Collision hazard active.", "action": "Seal Bulkheads & Re-vector Thrusters", "multipliers": {"health": -1.2, "subsystems.Thermal Control": -3.0, "subsystems.Propulsion": -1.0}},
+            "Micrometeorite Impact": {"affected_system": "Thermal Control", "desc": "Minor impact registered on outer shell.", "action": "Seal Bulkheads", "multipliers": {"health": -0.8, "subsystems.Thermal Control": -3.0}},
+            "Magnetic Interference": {"affected_system": "Communication", "desc": "Extremal magnetic fields distort signals.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -1.5, "subsystems.Navigation": -1.0}},
+            "Space Debris Collision": {"affected_system": "Thermal Control", "desc": "Debris impact on cargo module.", "action": "Seal Bulkheads & Divert Power", "multipliers": {"health": -2.5, "subsystems.Thermal Control": -4.0}},
+
+            # Communication
+            "Communication Loss": {"affected_system": "Communication", "desc": "S-Band High Gain Antenna signal carrier loss.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -1.8}},
+            "Signal Delay": {"affected_system": "Communication", "desc": "Heavy interplanetary noise delays telemetry packets.", "action": "Manual Antenna Realignment", "multipliers": {"subsystems.Communication": -0.8}},
+            "Signal Corruption": {"affected_system": "Communication", "desc": "Checksum failures detected on telemetry transmission streams.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -1.2}},
+            "Ground Station Failure": {"affected_system": "Communication", "desc": "Deep Space Network Earth receiver is offline.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -1.0}},
+            "Relay Failure": {"affected_system": "Communication", "desc": "Lander network orbit relayer suffers transponder drop.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -1.4}},
+            "Network Saturation": {"affected_system": "Communication", "desc": "Bandwidth limit exceeded. Telemetry packet drop rate spike.", "action": "Initiate Automated Sweeps", "multipliers": {"subsystems.Communication": -0.5}},
+
+            # Navigation
+            "Navigation Drift": {"affected_system": "Navigation", "desc": "IMU gyro drift introduces coordinate discrepancies.", "action": "Perform Star-Field Overlay", "multipliers": {"subsystems.Navigation": -1.5, "position_error": 0.4}},
+            "Sensor Failure": {"affected_system": "Navigation", "desc": "Optical navigation scanner camera occlusion.", "action": "Perform Star-Field Overlay", "multipliers": {"subsystems.Navigation": -1.2}},
+            "Star Tracker Failure": {"affected_system": "Navigation", "desc": "Stellar reference tracking camera suffers shutter fault.", "action": "Perform Star-Field Overlay", "multipliers": {"subsystems.Navigation": -2.0, "position_error": 0.8}},
+            "Trajectory Deviation": {"affected_system": "Navigation", "desc": "Spacecraft flight path deviates from nominal vector.", "action": "Perform Star-Field Overlay", "multipliers": {"subsystems.Navigation": -1.0, "position_error": 0.6}},
+            "Position Estimation Error": {"affected_system": "Navigation", "desc": "Kalman filters register high variance in state estimation.", "action": "Perform Star-Field Overlay", "multipliers": {"subsystems.Navigation": -0.8, "position_error": 0.5}},
+
+            # Resource
+            "Fuel Leak": {"affected_system": "Propulsion", "desc": "Port valve gasket leak detected. Slow propellant drops.", "action": "Activate Backup Tank", "multipliers": {"fuel": -0.4, "subsystems.Propulsion": -1.2}},
+            "Power Failure": {"affected_system": "Power", "desc": "Compromised power grids trigger localized battery discharge.", "action": "Bypass Compromised Lines", "multipliers": {"power": -1.5, "subsystems.Power": -2.5}},
+            "Battery Degradation": {"affected_system": "Power", "desc": "Lithium cell matrix temperature spike decreases voltage output.", "action": "Bypass Compromised Lines", "multipliers": {"power": -0.6, "subsystems.Power": -1.2}},
+            "Oxygen Leak": {"affected_system": "Life Support", "desc": "Cabin module seals display micro-fissure drop rates.", "action": "Seal Bulkheads", "multipliers": {"oxygen": -1.2, "subsystems.Life Support": -2.0}},
+            "Cooling System Failure": {"affected_system": "Thermal Control", "desc": "Freon cooling pump failure registers telemetry drop.", "action": "Divert Power to Deflectors", "multipliers": {"temperature": 1.2, "subsystems.Thermal Control": -2.5}},
+            "Thermal Imbalance": {"affected_system": "Thermal Control", "desc": "Extreme temperature variance between solar side and deep space.", "action": "Divert Power to Deflectors", "multipliers": {"temperature": 0.8, "subsystems.Thermal Control": -1.5}},
+
+            # Propulsion
+            "Thruster Failure": {"affected_system": "Propulsion", "desc": "Asymmetrical thruster bells feedback failure.", "action": "Re-vector Remaining Bells", "multipliers": {"subsystems.Propulsion": -2.5}},
+            "Engine Failure": {"affected_system": "Propulsion", "desc": "Main combustion chamber shutdown.", "action": "Enable Backup Controller", "multipliers": {"velocity": -0.8, "subsystems.Propulsion": -4.0}},
+            "Partial Engine Loss": {"affected_system": "Propulsion", "desc": "RCS manifold secondary nozzles register offline.", "action": "Re-vector Remaining Bells", "multipliers": {"velocity": -0.3, "subsystems.Propulsion": -2.0}},
+            "Attitude Control Failure": {"affected_system": "Propulsion", "desc": "Command logic fails to orient spacecraft bells.", "action": "Enable Backup Controller", "multipliers": {"subsystems.Propulsion": -1.8, "position_error": 0.5}},
+            "Fuel Pump Failure": {"affected_system": "Propulsion", "desc": "Turbopump cavitation restricts fuel injection rate.", "action": "Enable Backup Controller", "multipliers": {"fuel": -0.2, "subsystems.Propulsion": -2.2}},
+
+            # Life Support
+            "Oxygen Contamination": {"affected_system": "Life Support", "desc": "Particulate matter filters register high carbon limits.", "action": "Seal Bulkheads", "multipliers": {"oxygen": -0.6, "subsystems.Life Support": -1.8}},
+            "Pressure Loss": {"affected_system": "Life Support", "desc": "Cabin compartment registers rapid pressure loss.", "action": "Seal Bulkheads", "multipliers": {"oxygen": -1.8, "subsystems.Life Support": -3.5}},
+            "CO2 Filter Failure": {"affected_system": "Life Support", "desc": "Zeolite scrubber beds saturated. CO2 limits warning.", "action": "Seal Bulkheads", "multipliers": {"oxygen": -0.8, "subsystems.Life Support": -2.0}},
+            "Life Support Failure": {"affected_system": "Life Support", "desc": "Environmental control systems offline.", "action": "Seal Bulkheads", "multipliers": {"oxygen": -2.5, "subsystems.Life Support": -5.0}},
+
+            # Science
+            "Unknown Object Detection": {"affected_system": "Science Systems", "desc": "Radar reflection indicates orbiting localized mass.", "action": "Run Damage Diagnostic", "multipliers": {"subsystems.Science Systems": -0.2}},
+            "Unidentified Signal": {"affected_system": "Science Systems", "desc": "Wideband radio transmitter picks up stellar signal.", "action": "Run Damage Diagnostic", "multipliers": {"subsystems.Science Systems": -0.2}},
+            "Scientific Opportunity": {"affected_system": "Science Systems", "desc": "Atypical gravitational pocket offers telemetry collection scans.", "action": "Run Damage Diagnostic", "multipliers": {}},
+            "Resource Discovery": {"affected_system": "Science Systems", "desc": "Near-asteroid registers trace heavy isotopes.", "action": "Run Damage Diagnostic", "multipliers": {}}
+        }
+
         self.reset_state()
         
         self.running_task = None
@@ -299,7 +373,7 @@ class SpacecraftSimulator:
             ],
             "Solar Storm": [
                 {"action_key": "solar_storm_ignore", "action_name": "Ignore Anomaly", "description": "Keep secondary grids active. High risk of electronics failure."},
-                {"action_key": "solar_storm_retract_panels", "action_name": "Retract Secondary Panels", "description": "Puts solar grids into secure configurations and deploy carbon shields."},
+                {"action_key": "solar_storm_retract_panels", "action_name": "Retract Panels", "description": "Puts solar grids into secure configurations and deploy carbon shields."},
                 {"action_key": "solar_storm_divert_power", "action_name": "Divert Power to Deflectors", "description": "Activate active magnetic deflection shield surrounding the hull."}
             ],
             "Thruster Failure": [
@@ -349,6 +423,7 @@ class SpacecraftSimulator:
         self.state = "Idle"
         self.duration = 0.0
         self.target_distance = 1000000.0
+        self.distance_remaining = self.target_distance
         
         # Telemetry variables
         self.fuel = 100.0
@@ -374,8 +449,24 @@ class SpacecraftSimulator:
         
         self.active_events: List[Dict[str, Any]] = []
         self.event_timer = 0.0
-        self.next_event_time = self.get_randomized_event_time()
+        self.next_event_time = float('inf')  # Automatic events disabled
         
+        self.fuel_capacity = 50000.0
+        self.fuel_mass = 50000.0
+        self.initial_main_fuel = None
+        self.initial_backup_fuel = None
+        self.initial_emergency_fuel = None
+        self.main_fuel = 0.0
+        self.backup_fuel = 0.0
+        self.emergency_fuel = 0.0
+        self.speed_multiplier = 1.0
+        self.payload_mass = 10000.0
+        self.cruise_speed = 30.0
+        self.engine_thrust = 1500.0
+        self.time_scale = None
+        self.agent_decisions = []
+        self.recovery_actions = []
+
         self.power_decay_start = 100.0
         self.power_decay_time = 0.0
         
@@ -396,15 +487,87 @@ class SpacecraftSimulator:
         
         # Playback buffers
         self.mission_history: List[Dict[str, Any]] = []
+        self.pending_outcome_checks = []
+
+        # --- PHASE 2.8 SCENARIO & RECOVERY STATE VARIABLES ---
+        self.active_scenario = None
+        self.scenario_timer = 0.0
+        self.scenario_triggered_events = set()
+        self.recovery_start_times = {}
+        self.recovery_mitigate_times = {}
+        self.recovery_initial_metrics = {}
+        self.resilience_score = 100.0
+        self.adaptability_score = 100.0
+        self.survivability_score = 100.0
+        self.recovery_efficiency = 100.0
+        self.system_stability = 100.0
+        self.overall_robustness = 100.0
+
+        # --- DB BATCH WRITE BUFFERS ---
+        self.telemetry_write_buffer = []
+        self.subsystem_write_buffer = []
+        self.risk_write_buffer = []
+        self.memory_write_buffer = []
+        self.resilience_write_buffer = []
+        self.tick_counter = 0
+        self.last_broadcast_state = None
+        self.last_active_events_hash = None
+        self.fuel_required = 0.0
+        self.travel_time_h = 0.0
+        self.feasibility = True
+
+    async def sync_with_trajectory(self):
+        from backend.trajectory.planner import TrajectoryPlanner
+        from backend.database.models import DestinationModel
+        from sqlalchemy import select
+        from backend.database.connection import SessionLocal
+
+        planner = await TrajectoryPlanner.load_from_redis()
+        target_distance = 1000000.0
+        if SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    stmt = select(DestinationModel).where(DestinationModel.name == planner.destination)
+                    res = await db.execute(stmt)
+                    dest = res.scalars().first()
+                    if dest:
+                        target_distance = dest.avg_distance_km
+            except Exception as e:
+                print(f"[Engine] DB error loading target distance in sync_with_trajectory: {e}")
+
+        outputs = planner.calculate(target_distance)
+        
+        self.destination = planner.destination
+        trajectory_distance = outputs["distance_km"]
+        self.target_distance = trajectory_distance
+        self.distance_remaining = trajectory_distance
+        
+        # Fuel loading configuration based on Trajectory Assessment
+        self.initial_main_fuel = outputs["required_mission_fuel"]
+        self.initial_backup_fuel = outputs["reserve_fuel"]
+        self.initial_emergency_fuel = outputs["emergency_fuel"]
+        
+        self.main_fuel = self.initial_main_fuel
+        self.backup_fuel = self.initial_backup_fuel
+        self.emergency_fuel = self.initial_emergency_fuel
+        
+        self.fuel_mass = outputs["total_fuel_loaded"]
+        self.fuel_capacity = outputs["total_fuel_loaded"]
+        self.fuel = 100.0
+        
+        self.payload_mass = planner.payload_mass
+        self.cruise_speed = planner.cruise_speed
+        self.engine_thrust = planner.engine_thrust
+
+        # Trajectory details
+        self.fuel_required = outputs["total_fuel_loaded"]
+        self.travel_time_h = outputs["travel_time_h"]
+        self.feasibility = outputs["feasibility"]
 
     def get_randomized_event_time(self) -> float:
-        if self.difficulty == "Easy":
-            return random.uniform(45.0, 60.0)
-        elif self.difficulty == "Hard":
-            return random.uniform(20.0, 30.0)
-        elif self.difficulty == "Extreme":
-            return random.uniform(10.0, 20.0)
-        return random.uniform(30.0, 45.0)
+        # DISABLED: Automatic event generation removed.
+        # Anomalies are only created via manual user injection.
+        return float('inf')
 
     def get_mission_info(self) -> MissionInfo:
         return MissionInfo(
@@ -421,9 +584,29 @@ class SpacecraftSimulator:
         )
 
     def get_telemetry_data(self) -> TelemetryData:
+        main_pct = (self.main_fuel / self.initial_main_fuel) * 100.0 if (getattr(self, "initial_main_fuel", None) or 0) > 0 else 100.0
+        backup_pct = (self.backup_fuel / self.initial_backup_fuel) * 100.0 if (getattr(self, "initial_backup_fuel", None) or 0) > 0 else 100.0
+        emergency_pct = (self.emergency_fuel / self.initial_emergency_fuel) * 100.0 if (getattr(self, "initial_emergency_fuel", None) or 0) > 0 else 100.0
+
+        main_pct = max(0.0, min(100.0, main_pct))
+        backup_pct = max(0.0, min(100.0, backup_pct))
+        emergency_pct = max(0.0, min(100.0, emergency_pct))
+
+        dist_remaining = max(0.0, self.target_distance - self.distance)
+        elapsed_days = int(self.duration / 86400)
+
+        # Use stored attribute if available, fallback to calculation
+        distance_rem = getattr(self, 'distance_remaining', dist_remaining)
+
         return TelemetryData(
             timestamp=datetime.utcnow().isoformat(),
             fuel=round(self.fuel, 2),
+            main_fuel_pct=round(main_pct, 1),
+            backup_fuel_pct=round(backup_pct, 1),
+            emergency_fuel_pct=round(emergency_pct, 1),
+            simulation_speed=f"{int(getattr(self, 'speed_multiplier', 1.0))}X",
+            mission_elapsed=f"{elapsed_days} Days",
+            distance_remaining=f"{distance_rem:,.0f} km",
             power=round(self.power, 2),
             oxygen=round(self.oxygen, 2),
             temperature=round(self.temperature, 2),
@@ -438,7 +621,18 @@ class SpacecraftSimulator:
             subsystems=self.subsystems,
             success_probability=round(self.success_probability, 1),
             failure_probability=round(self.failure_probability, 1),
-            confidence_score=round(self.confidence_score, 1)
+            confidence_score=round(self.confidence_score, 1),
+            eta=self.eta_time.isoformat() if getattr(self, "eta_time", None) else "N/A",
+            fuel_required=round(getattr(self, "fuel_required", 0.0), 1),
+            travel_time_h=round(getattr(self, "travel_time_h", 0.0), 1),
+            feasibility=bool(getattr(self, "feasibility", True)),
+            main_fuel_mass=round(getattr(self, "main_fuel", 0.0), 1),
+            backup_fuel_mass=round(getattr(self, "backup_fuel", 0.0), 1),
+            emergency_fuel_mass=round(getattr(self, "emergency_fuel", 0.0), 1),
+            total_fuel_mass=round(getattr(self, "fuel_mass", 0.0), 1),
+            burn_rate=round(getattr(self, "burn_rate_kg_s", 0.0), 2),
+            fuel_consumed=round(max(0.0, self.fuel_capacity - self.fuel_mass), 1),
+            acceleration=round(getattr(self, "a", 0.0) * 1000.0, 4)
         )
 
     async def log_event(self, event_type: str, message: str):
@@ -462,10 +656,48 @@ class SpacecraftSimulator:
 
     async def start(self):
         if self.state == "Idle" or self.state == "Completed":
+            # Load TrajectoryPlanner, compute Required Fuel.
+            from backend.trajectory.planner import TrajectoryPlanner
+            from backend.database.models import DestinationModel
+            from sqlalchemy import select
+            from backend.database.connection import SessionLocal
+
+            planner = await TrajectoryPlanner.load_from_redis()
+            target_distance = 1000000.0
+            if SessionLocal:
+                try:
+                    async with connection.SessionLocal() as db:
+                        stmt = select(DestinationModel).where(DestinationModel.name == planner.destination)
+                        res = await db.execute(stmt)
+                        dest = res.scalars().first()
+                        if dest:
+                            target_distance = dest.avg_distance_km
+                except Exception as e:
+                    print(f"[Engine] DB error loading target distance: {e}")
+
+            # Synchronize simulator parameters to ensure we have the latest trajectory values
+            await self.sync_with_trajectory()
+
+            outputs = planner.calculate(target_distance)
+            required_fuel_kg = outputs["total_fuel_loaded"]
+            # Use the simulator's fuel_capacity which was set by sync_with_trajectory()
+            # to match the actual total fuel loaded (main + backup + emergency tanks).
+            # Previously this used planner.fuel_capacity (a small default like 30,000 kg)
+            # which is not the actual fuel available in the simulator's tanks.
+            available_fuel_kg = self.fuel_capacity
+
+            if available_fuel_kg < required_fuel_kg:
+                msg = f"MISSION REJECTED: Insufficient Fuel. Required: {required_fuel_kg:,.0f} kg, Available: {available_fuel_kg:,.0f} kg"
+                await self.log_event("ERROR", msg)
+                return {"status": "error", "message": msg}
+
             self.reset_state()
+            await self.sync_with_trajectory()
             self.state = "Launch"
             self.launch_time = datetime.utcnow()
+
             await self.log_event("INFO", f"Mission Initialized on {self.difficulty} Mode - Engine Ignition Command")
+            await self.log_event("INFO", f"Trajectory Assessment: Distance = {self.target_distance:,.0f} km")
             
             # Set initial objectives status PENDING in database
             if connection.SessionLocal:
@@ -482,11 +714,14 @@ class SpacecraftSimulator:
         self.is_active = True
         if self.running_task is None or self.running_task.done():
             self.running_task = asyncio.create_task(self.run_simulation_loop())
+            
+        return {"status": "success", "message": "Mission started/resumed", "state": self.state}
 
     async def pause(self):
         if self.is_active:
             self.is_active = False
             await self.log_event("INFO", "Simulation paused")
+            await self.flush_buffers_to_db(force=True)
         else:
             await self.log_event("INFO", "Simulation already paused")
 
@@ -500,7 +735,18 @@ class SpacecraftSimulator:
             await self.save_history_replay()
             
         self.reset_state()
+        await self.sync_with_trajectory()
         
+        # Wipe dynamic databases
+        if connection.SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    from backend.database.connection import clear_transaction_tables
+                    await clear_transaction_tables(db)
+                    await db.commit()
+            except Exception as e:
+                print(f"[DB ERROR] Failed to clear tables on reset: {e}")
+
         redis = await get_redis()
         await redis.set("hail_mary:telemetry", "")
         await redis.delete("hail_mary:events")
@@ -523,74 +769,394 @@ class SpacecraftSimulator:
             except Exception as e:
                 print(f"[DB ERROR] Replay save failed: {e}")
 
+    async def process_pending_outcome_checks(self):
+        if not hasattr(self, 'pending_outcome_checks'):
+            self.pending_outcome_checks = []
+        
+        remaining_checks = []
+        for check in self.pending_outcome_checks:
+            check["ticks_remaining"] -= 1
+            if check["ticks_remaining"] <= 0:
+                # Evaluate prediction accuracy
+                actual_success = self.success_probability
+                predicted_success = check["predicted_success"]
+                pred_err = abs(predicted_success - actual_success)
+                pred_accuracy = max(0.0, min(1.0, 1.0 - (pred_err / 100.0)))
+                
+                # Save to mission_experiences
+                if connection.SessionLocal:
+                    try:
+                        async with connection.SessionLocal() as db:
+                            exp = MissionExperienceModel(
+                                timestamp=datetime.utcnow(),
+                                situation=f"Mitigated {check['event_type']} via {check['action_key']}",
+                                state_snapshot=check["state_snapshot"],
+                                active_events=check["active_events"],
+                                chosen_action=check["action_key"],
+                                expected_outcome=json.dumps({"success_probability": round(predicted_success, 1)}),
+                                actual_outcome=json.dumps({"success_probability": round(actual_success, 1)}),
+                                success_score=round(actual_success, 1),
+                                mission_result="SUCCESS" if self.state == "Completed" or actual_success > 50.0 else "FAILURE"
+                            )
+                            db.add(exp)
+                            
+                            # Log to AutonomyMetricsModel
+                            metric = AutonomyMetricsModel(
+                                timestamp=datetime.utcnow(),
+                                decision_accuracy=0.9 if actual_success > 60 else 0.5,
+                                prediction_accuracy=round(pred_accuracy, 3),
+                                success_rate=0.95 if self.state == "Completed" else 0.8,
+                                risk_reduction=round(max(0.0, check["initial_success_probability"] - self.risk_score), 1),
+                                resource_efficiency=round(self.fuel / 100.0, 2),
+                                autonomy_level=self.autonomy_level,
+                                maturity_index=round(self.autonomy_level * 0.2 + pred_accuracy * 0.8, 2)
+                            )
+                            await db.commit()
+
+                            # Hook Phase 3.5 LLM outcome evaluator
+                            try:
+                                from backend.agent.llm_reasoning import llm_reasoning_engine
+                                await llm_reasoning_engine.update_actual_outcomes(
+                                    action_key=check["action_key"],
+                                    initial_success=check["initial_success_probability"],
+                                    final_success=actual_success,
+                                    initial_risk=check.get("initial_risk", 15.0),
+                                    final_risk=self.risk_score
+                                )
+                            except Exception as llm_ex:
+                                print(f"[LLM Outcome Hook Error] {llm_ex}")
+                    except Exception as ex:
+                        print(f"[DB ERROR] Pending check database write failed: {ex}")
+            else:
+                remaining_checks.append(check)
+        self.pending_outcome_checks = remaining_checks
+
+    async def save_mission_experience_summary(self, result: str):
+        if connection.SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    exp = MissionExperienceModel(
+                        timestamp=datetime.utcnow(),
+                        situation=f"Mission finished in state {self.state} with result {result}",
+                        state_snapshot=self.get_telemetry_data().model_dump_json(),
+                        active_events=json.dumps([e["event_type"] for e in self.active_events]),
+                        chosen_action="Mission End",
+                        expected_outcome=json.dumps({"success_probability": 100.0 if result == "SUCCESS" else 0.0}),
+                        actual_outcome=json.dumps({"success_probability": self.success_probability}),
+                        success_score=round(self.success_probability, 1),
+                        mission_result=result
+                    )
+                    db.add(exp)
+                    
+                    # Add an autonomy metrics summary
+                    metric = AutonomyMetricsModel(
+                        timestamp=datetime.utcnow(),
+                        decision_accuracy=0.95 if result == "SUCCESS" else 0.40,
+                        prediction_accuracy=0.90,
+                        success_rate=1.0 if result == "SUCCESS" else 0.0,
+                        risk_reduction=50.0 if result == "SUCCESS" else 0.0,
+                        resource_efficiency=round(self.fuel / 100.0, 2),
+                        autonomy_level=self.autonomy_level,
+                        maturity_index=round(self.autonomy_level * 0.2 + 0.72, 2)
+                    )
+                    db.add(metric)
+                    
+                    await db.commit()
+                    print(f"[DB] Saved mission end experience summary: {result}")
+            except Exception as e:
+                print(f"[DB ERROR] Mission experience summary save failed: {e}")
+
     async def run_simulation_loop(self):
         dt = 1.0
         try:
             while self.is_active:
                 await self.update_physics(dt)
-                await self.check_event_generator(dt)
+                await self.update_lifecycle_phase()
+                await self.process_scenario_ticks(dt)
+                # DISABLED: await self.check_event_generator(dt)  — No automatic anomaly generation
                 await self.calculate_success_scores()
                 await self.calculate_risk()
+                await self.calculate_resilience_scores()
+                
+                # Check for autonomous recovery trigger (Feature 11)
+                if self.risk_score > 80.0:
+                    await self.trigger_autonomous_recovery()
+                    
                 await self.save_state_to_storages()
                 await self.broadcast_telemetry()
                 await self.append_snapshot_memory()
+                await self.process_pending_outcome_checks()
+
+                # Trigger autonomous agent decisions if active events exist and autonomy > 0
+                if self.autonomy_level > 0 and not self.agent_workflow_running:
+                    unresolved = [e for e in self.active_events if e.get("status") not in ["MITIGATING", "RESOLVED"]]
+                    if unresolved:
+                        self.agent_workflow_running = True
+                        async def run_workflow():
+                            try:
+                                await self.trigger_agent_decision_workflow()
+                            finally:
+                                self.agent_workflow_running = False
+                        asyncio.create_task(run_workflow())
+
+                self.tick_counter += 1
+                await self.flush_buffers_to_db()
+
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             await self.log_event("ERROR", f"Simulation engine exception: {e}")
 
+    async def trigger_agent_decision_workflow(self):
+        unresolved_events = [e for e in self.active_events if e.get("status") not in ["MITIGATING", "RESOLVED"]]
+        if not unresolved_events:
+            return
+
+        try:
+            from backend.agent.langgraph import graph_orchestrator
+            telemetry = self.get_telemetry_data().model_dump()
+            decisions = await graph_orchestrator.run_decision_workflow(
+                telemetry=telemetry,
+                active_events=unresolved_events,
+                action_options=self.action_options,
+                difficulty=self.difficulty,
+                autonomy_level=self.autonomy_level
+            )
+            for d in decisions:
+                event_id = d["event_id"]
+                chosen_action = d["chosen_action"]
+                
+                # Autonomy level checks for execution
+                should_execute = False
+                if self.autonomy_level == 4:
+                    should_execute = True
+                elif self.autonomy_level == 3:
+                    # Classify if safe
+                    is_safe = chosen_action not in ["fuel_leak_ignore", "solar_storm_ignore", "fuel_leak_emergency_shutdown"]
+                    if is_safe:
+                        should_execute = True
+                        
+                if should_execute:
+                    await self.execute_action(event_id, chosen_action)
+        except Exception as e:
+            print(f"[Autonomy Error] Decision workflow failed: {e}")
+
     async def update_physics(self, dt: float):
-        self.duration += dt
-        self.event_timer += dt
+        # We need TrajectoryPlanner to get the parameters
+        from backend.trajectory.planner import TrajectoryPlanner
+        planner = await TrajectoryPlanner.load_from_redis()
+        
+        # Load destination target distance from DB
+        from backend.database.models import DestinationModel
+        from sqlalchemy import select
+        from backend.database.connection import SessionLocal
+        
+        target_distance = 1000000.0
+        if SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    stmt = select(DestinationModel).where(DestinationModel.name == planner.destination)
+                    res = await db.execute(stmt)
+                    dest = res.scalars().first()
+                    if dest:
+                        target_distance = dest.avg_distance_km
+            except Exception as e:
+                print(f"[Engine] DB error loading target distance: {e}")
+        
+        self.destination = planner.destination
+        if getattr(self, "fuel_capacity", 0.0) <= 0.0:
+            self.fuel_capacity = getattr(self, "fuel_required", planner.fuel_capacity) or planner.fuel_capacity
+        self.payload_mass = planner.payload_mass
+        self.cruise_speed = planner.cruise_speed
+        self.engine_thrust = planner.engine_thrust
+        
+        # Calculate nominal travel time
+        outputs = planner.calculate(target_distance)
+        nominal_travel_time_seconds = outputs["travel_time_h"] * 3600.0
+        
+        # Initialize speed_multiplier if not exists
+        if getattr(self, "speed_multiplier", None) is None:
+            self.speed_multiplier = 1.0        # Initialize fuel tanks if not setup
+        if getattr(self, "initial_main_fuel", None) is None:
+            self.initial_main_fuel = outputs["required_mission_fuel"]
+            self.initial_backup_fuel = outputs["reserve_fuel"]
+            self.initial_emergency_fuel = outputs["emergency_fuel"]
+            
+            self.main_fuel = self.initial_main_fuel
+            self.backup_fuel = self.initial_backup_fuel
+            self.emergency_fuel = self.initial_emergency_fuel
+            
+            self.fuel_mass = outputs["total_fuel_loaded"]
+            self.fuel_capacity = outputs["total_fuel_loaded"]
+            self.fuel_required = outputs["fuel_required_kg"]
 
-        # Crew oxygen decay scaled by Life Support performance
-        perf_life = self.subsystems["Life Support"]["performance"]
-        oxygen_rate = 0.05
-        if self.difficulty == "Hard": oxygen_rate = 0.08
-        if self.difficulty == "Extreme": oxygen_rate = 0.12
+        virtual_dt = dt * self.speed_multiplier
         
-        self.oxygen = max(0.0, self.oxygen - oxygen_rate * dt * (2.0 - perf_life))
-        
-        if self.oxygen < 20.0 and self.state != "Emergency" and self.oxygen > 0:
-            self.state = "Emergency"
-            await self.log_event("WARNING", "O2 levels critical (<20%)! Entering emergency mode.")
-
-        # Engine propulsion physics (scaled by Propulsion performance)
-        perf_prop = self.subsystems["Propulsion"]["performance"]
-        current_propellant_mass = (self.fuel / 100.0) * self.propellant_mass
-        total_mass = self.dry_mass + current_propellant_mass
-        
-        if self.state == "Launch":
-            self.thrust_force = 3800000.0 * perf_prop
-            self.fuel = max(0.0, self.fuel - 0.9 * dt)
-            self.temperature = min(88.0, self.temperature + 1.1 * dt)
-        elif self.state == "Maneuver":
-            self.thrust_force = 1200000.0 * perf_prop
-            self.fuel = max(0.0, self.fuel - 0.25 * dt)
-            self.temperature = min(45.0, self.temperature + 0.4 * dt)
+        # Substep integration for numerical stability and consistency
+        # Max substep size is 1.0 second
+        max_substep = 1.0
+        if virtual_dt > max_substep:
+            num_substeps = math.ceil(virtual_dt / max_substep)
+            substep_dt = virtual_dt / num_substeps
         else:
-            self.thrust_force = 0.0
-            if self.temperature > 22.0:
-                self.temperature = max(22.0, self.temperature - 0.6 * dt)
+            num_substeps = 1
+            substep_dt = virtual_dt
+
+        self.burn_rate_kg_s = 0.0
+
+        for _ in range(num_substeps):
+            if self.distance >= self.target_distance:
+                break
+            # Crew oxygen decay scaled by Life Support performance (with a 2x safety margin factor)
+            perf_life = self.subsystems["Life Support"]["performance"]
+            base_depletion_rate = (100.0 / nominal_travel_time_seconds) * 0.5
+            difficulty_factor = {"Easy": 0.5, "Normal": 1.0, "Hard": 1.5, "Extreme": 2.2}[self.difficulty]
+            oxygen_decay = base_depletion_rate * difficulty_factor * (2.0 - perf_life) * substep_dt
+            self.oxygen = max(0.0, self.oxygen - oxygen_decay)
+            
+            # Engine propulsion physics (scaled by Propulsion performance)
+            perf_prop = self.subsystems["Propulsion"]["performance"]
+            effective_thrust_kn = self.engine_thrust * perf_prop
+            
+            # Check active anomalies that impact propulsion/distance/fuel
+            fuel_leak_active = any(e["event_type"] == "Fuel Leak" for e in self.active_events)
+            thruster_failure_active = any(e["event_type"] == "Thruster Failure" for e in self.active_events)
+            nav_drift_active = any(e["event_type"] == "Navigation Drift" for e in self.active_events)
+            
+            if thruster_failure_active:
+                effective_thrust_kn *= 0.7
+
+            # Determine if engines are firing in this phase
+            # Deceleration physics
+            # Time to decelerate from self.velocity to 0.1 km/s: t = (v - 0.1) / a
+            # a = (thrust_force / mass) / 1000.0 km/s^2
+            # Calculate dynamic acceleration available for deceleration
+            inertia_fuel_mass_decel = min(self.fuel_mass, 50000.0)
+            total_mass_decel = self.dry_mass + self.payload_mass + inertia_fuel_mass_decel
+            a_decel_calc = ((effective_thrust_kn * 1000.0) / total_mass_decel) / 1000.0 if total_mass_decel > 0 else 0.01
+            if a_decel_calc <= 0.0:
+                a_decel_calc = 0.001
+                
+            dist_rem = max(0.0, self.target_distance - self.distance)
+            current_vel = self.velocity
+            target_vel = 0.1
+            
+            if current_vel > target_vel:
+                t_decel_needed = (current_vel - target_vel) / a_decel_calc
+                d_decel_needed = 0.5 * (current_vel + target_vel) * t_decel_needed
             else:
-                self.temperature = min(22.0, self.temperature + 0.1 * dt)
+                d_decel_needed = 0.0
 
-        # Acceleration a = F / m
-        self.a = (self.thrust_force / total_mass) / 1000.0
-        
-        await self.process_active_event_impacts(dt)
+            is_decel_phase = self.state in ["Approach", "Landing / Deployment"]
+            is_decel_burning = is_decel_phase and (dist_rem <= d_decel_needed)
+            
+            engines_firing = (self.state in ["Launch", "Orbit Insertion", "Course Correction"]) or is_decel_burning
+            self.thrust_force = (effective_thrust_kn * 1000.0) if engines_firing else 0.0 # in Newtons
 
-        self.velocity = max(0.0, self.velocity + self.a * dt)
-        
-        distance_gained = (self.velocity * dt) + (0.5 * self.a * (dt ** 2))
-        self.distance += distance_gained
-        self.mission_progress = min(100.0, (self.distance / self.target_distance) * 100)
+            # Acceleration a = F / m
+            inertia_fuel_mass = min(self.fuel_mass, 50000.0)
+            total_mass = self.dry_mass + self.payload_mass + inertia_fuel_mass
+            self.a = (self.thrust_force / total_mass) / 1000.0 # in km/s^2
 
-        # Navigation performance scales coordinate drift error
-        perf_nav = self.subsystems["Navigation"]["performance"]
-        self.position_error += (0.5 * (1.0 - perf_nav)) * dt
+            await self.process_active_event_impacts(substep_dt)
 
+            # Velocity integration and caps
+            effective_cruise_speed = self.cruise_speed
+            if thruster_failure_active:
+                effective_cruise_speed *= 0.8
+
+            if self.state in ["Launch", "Orbit Insertion", "Course Correction"]:
+                self.velocity = min(effective_cruise_speed, max(0.0, self.velocity + self.a * substep_dt))
+            elif self.state in ["Cruise", "Scientific Operations"]:
+                self.velocity = effective_cruise_speed
+            elif self.state in ["Approach", "Landing / Deployment"]:
+                if dist_rem <= d_decel_needed:
+                    # Decelerating
+                    self.velocity = max(0.1, self.velocity - self.a * substep_dt)
+                else:
+                    # Coasting during approach segment until decel point
+                    self.velocity = effective_cruise_speed
+            else: # Pre-Launch, Completed, Emergency
+                self.velocity = 0.0
+                self.a = 0.0
+
+            # Distance integration
+            if self.state != "Pre-Launch":
+                self.distance = min(self.target_distance, self.distance + self.velocity * substep_dt)
+            else:
+                self.distance = 0.0
+
+            # Navigation performance scales coordinate drift error
+            perf_nav = self.subsystems["Navigation"]["performance"]
+            self.position_error += (0.5 * (1.0 - perf_nav)) * substep_dt
+
+            # Target distance affected by Navigation Drift
+            if nav_drift_active:
+                self.target_distance = target_distance * 1.15
+            else:
+                self.target_distance = target_distance
+
+            # Distance Remaining & Mission Progress
+            distance_remaining = max(0.0, self.target_distance - self.distance)
+            self.distance_remaining = distance_remaining
+            self.mission_progress = min(100.0, (self.distance / self.target_distance) * 100.0)
+
+            # Fuel consumption
+            if engines_firing:
+                isp = 300.0
+                g0 = 9.80665
+                burn_rate_kg_s = (effective_thrust_kn * 1000.0) / (isp * g0)
+            else:
+                burn_rate_kg_s = 0.0
+                
+            if fuel_leak_active:
+                burn_rate_kg_s += 0.5
+                
+            self.burn_rate_kg_s = burn_rate_kg_s
+            fuel_consumed_kg = burn_rate_kg_s * substep_dt
+            
+            # Tank selection drawing sequence priority
+            emergency_triggered = (self.risk_score > 50.0) or \
+                                   any(e.get("status") == "MITIGATING" for e in self.active_events) or \
+                                   (self.state == "Emergency")
+
+            backup_triggered = any(e["event_type"] in ["Fuel Leak", "Navigation Drift", "Sensor Malfunction", "Trajectory Deviation", "Position Estimation Error"] for e in self.active_events)
+
+            if emergency_triggered:
+                draw_order = ["emergency", "backup", "main"]
+            elif backup_triggered:
+                draw_order = ["backup", "main", "emergency"]
+            else:
+                draw_order = ["main", "backup", "emergency"]
+
+            rem_consumption = fuel_consumed_kg
+            for tank in draw_order:
+                if rem_consumption <= 0:
+                    break
+                if tank == "main":
+                    if self.main_fuel > 0:
+                        deduct = min(self.main_fuel, rem_consumption)
+                        self.main_fuel -= deduct
+                        rem_consumption -= deduct
+                elif tank == "backup":
+                    if self.backup_fuel > 0:
+                        deduct = min(self.backup_fuel, rem_consumption)
+                        self.backup_fuel -= deduct
+                        rem_consumption -= deduct
+                elif tank == "emergency":
+                    if self.emergency_fuel > 0:
+                        deduct = min(self.emergency_fuel, rem_consumption)
+                        self.emergency_fuel -= deduct
+                        rem_consumption -= deduct
+
+            self.fuel_mass = max(0.0, self.main_fuel + self.backup_fuel + self.emergency_fuel)
+            self.fuel = (self.fuel_mass / self.fuel_capacity) * 100.0
+
+            # Mission Duration
+            self.duration += substep_dt
+
+        # Update 3D position coordinates based on final integrated distance
         angle = self.distance * 0.00015
         radius = 20.0 + (self.mission_progress * 0.4)
         
@@ -598,25 +1164,155 @@ class SpacecraftSimulator:
         self.position["y"] = 4.0 * math.sin(angle * 2.0) + (self.angular_velocity["y"] * 10)
         self.position["z"] = radius * math.sin(angle) + (self.angular_velocity["z"] * 10)
 
-        if self.state == "Launch" and self.velocity >= 12.0:
-            self.state = "Cruise"
-            await self.log_event("INFO", "Escape velocity reached. Cruising at constant speed.")
-            
-        # Check mission objectives outcome conditions
-        if self.mission_progress >= 100.0:
-            self.state = "Completed"
-            self.velocity = 0.0
-            self.a = 0.0
-            self.is_active = False
-            await self.log_event("INFO", "Mission Completed - Hail Mary has achieved stable orbit!")
-            await self.update_db_objectives(status="ACHIEVED")
+        # ETA time
+        seconds_remaining = self.distance_remaining / self.velocity if self.velocity > 0.0 else self.distance_remaining / self.cruise_speed
+        self.eta_time = ist_now() + timedelta(seconds=seconds_remaining)
 
-        # Evaluate mission objective failure triggers
-        if self.fuel <= 0.0 or self.power <= 10.0 or self.health <= 0.0 or self.oxygen <= 0.0:
+        # Success / Failure conditions evaluation
+        failed = False
+        failure_cause = ""
+        
+        if self.fuel <= 0.0 or self.fuel_mass <= 0.0:
+            failed = True
+            failure_cause = "Fuel Exhaustion"
+        elif self.oxygen <= 0.0:
+            failed = True
+            failure_cause = "Life Support Failure (Oxygen Depleted)"
+        elif self.subsystems["Propulsion"]["health"] <= 0.0:
+            failed = True
+            failure_cause = "Critical Subsystem Failure (Propulsion)"
+        elif self.subsystems["Power"]["health"] <= 0.0:
+            failed = True
+            failure_cause = "Critical Subsystem Failure (Power Grid)"
+        elif self.subsystems["Life Support"]["health"] <= 0.0:
+            failed = True
+            failure_cause = "Critical Subsystem Failure (Life Support System)"
+        elif self.duration >= 1.5 * nominal_travel_time_seconds:
+            failed = True
+            failure_cause = "Mission Timeout (Trajectory Over-drift)"
+
+        if failed:
             self.state = "Emergency"
             self.is_active = False
-            await self.log_event("ERROR", "CRITICAL METRICS FAILURE: Life Support / Energy depletion.")
+            self.velocity = 0.0
+            self.a = 0.0
+            
+            summary = {
+                "distance_travelled": float(self.distance),
+                "avg_velocity": float(self.distance / (self.duration / 3600.0) if self.duration > 0 else 0.0),
+                "fuel_efficiency": float(self.distance / (self.fuel_capacity - self.fuel_mass) if (self.fuel_capacity - self.fuel_mass) > 0 else 0.0),
+                "agent_decisions": self.agent_decisions,
+                "recovery_actions": self.recovery_actions,
+                "mission_outcome": "FAILURE"
+            }
+            
+            await self.log_event("ERROR", f"MISSION FAILURE: {failure_cause}")
             await self.update_db_objectives(status="FAILED")
+            await self.save_mission_experience_summary(result="FAILURE")
+            
+            backup_pct = (self.backup_fuel / self.initial_backup_fuel) * 100.0 if getattr(self, "initial_backup_fuel", 0) > 0 else 0.0
+            emergency_pct = (self.emergency_fuel / self.initial_emergency_fuel) * 100.0 if getattr(self, "initial_emergency_fuel", 0) > 0 else 0.0
+
+            # Broadcast Mission Failure
+            await manager.broadcast_json({
+                "type": "MISSION_FAILED",
+                "data": {
+                    "failure_cause": failure_cause,
+                    "distance_remaining": float(distance_remaining),
+                    "fuel_remaining_kg": float(self.fuel_mass),
+                    "fuel_remaining_pct": float(self.fuel),
+                    "backup_fuel_pct": float(max(0.0, min(100.0, backup_pct))),
+                    "emergency_fuel_pct": float(max(0.0, min(100.0, emergency_pct))),
+                    "mission_progress": float(self.mission_progress),
+                    "summary": summary
+                }
+            })
+            
+        elif self.distance >= self.target_distance:
+            # Reached destination, check success parameters
+            fuel_reserve_ok = self.fuel >= 5.0
+            systems_ok = (
+                self.subsystems["Propulsion"]["health"] > 10.0 and
+                self.subsystems["Power"]["health"] > 10.0 and
+                self.subsystems["Life Support"]["health"] > 10.0
+            )
+            
+            if fuel_reserve_ok and systems_ok:
+                self.state = "Completed"
+                self.is_active = False
+                self.velocity = 0.0
+                self.a = 0.0
+                
+                science_score = self.subsystems["Science Systems"]["performance"] * 100.0
+                mission_score = (self.health * 0.4) + (self.fuel * 0.4) + (max(0.0, 100.0 - self.position_error) * 0.2)
+                
+                summary = {
+                    "distance_travelled": float(self.distance),
+                    "avg_velocity": float(self.distance / (self.duration / 3600.0) if self.duration > 0 else 0.0),
+                    "fuel_efficiency": float(self.distance / (self.fuel_capacity - self.fuel_mass) if (self.fuel_capacity - self.fuel_mass) > 0 else 0.0),
+                    "agent_decisions": self.agent_decisions,
+                    "recovery_actions": self.recovery_actions,
+                    "mission_outcome": "SUCCESS"
+                }
+                
+                await self.log_event("INFO", "Mission Completed - Hail Mary has achieved stable orbit!")
+                await self.update_db_objectives(status="ACHIEVED")
+                await self.save_mission_experience_summary(result="SUCCESS")
+                
+                backup_used = ((self.initial_backup_fuel - self.backup_fuel) / self.initial_backup_fuel * 100.0) if self.initial_backup_fuel > 0 else 0.0
+
+                # Broadcast Mission Success
+                await manager.broadcast_json({
+                    "type": "MISSION_SUCCESS",
+                    "data": {
+                        "destination": self.destination,
+                        "duration": float(self.duration),
+                        "fuel_remaining_pct": float(self.fuel),
+                        "backup_fuel_used_pct": float(max(0.0, min(100.0, backup_used))),
+                        "commander_decisions": len(self.recovery_actions),
+                        "recovery_actions": len(self.agent_decisions),
+                        "science_score": float(science_score),
+                        "mission_score": float(mission_score),
+                        "summary": summary
+                    }
+                })
+            else:
+                # Failed due to criteria upon reaching destination
+                self.state = "Emergency"
+                self.is_active = False
+                self.velocity = 0.0
+                self.a = 0.0
+                
+                cause = "Fuel reserve depleted at destination" if not fuel_reserve_ok else "Critical system failures at destination"
+                summary = {
+                    "distance_travelled": float(self.distance),
+                    "avg_velocity": float(self.distance / (self.duration / 3600.0) if self.duration > 0 else 0.0),
+                    "fuel_efficiency": float(self.distance / (self.fuel_capacity - self.fuel_mass) if (self.fuel_capacity - self.fuel_mass) > 0 else 0.0),
+                    "agent_decisions": self.agent_decisions,
+                    "recovery_actions": self.recovery_actions,
+                    "mission_outcome": "FAILURE"
+                }
+                
+                await self.log_event("ERROR", f"MISSION FAILURE AT DESTINATION: {cause}")
+                await self.update_db_objectives(status="FAILED")
+                await self.save_mission_experience_summary(result="FAILURE")
+                
+                backup_pct = (self.backup_fuel / self.initial_backup_fuel) * 100.0 if getattr(self, "initial_backup_fuel", 0) > 0 else 0.0
+                emergency_pct = (self.emergency_fuel / self.initial_emergency_fuel) * 100.0 if getattr(self, "initial_emergency_fuel", 0) > 0 else 0.0
+
+                await manager.broadcast_json({
+                    "type": "MISSION_FAILED",
+                    "data": {
+                        "failure_cause": cause,
+                        "distance_remaining": float(distance_remaining),
+                        "fuel_remaining_kg": float(self.fuel_mass),
+                        "fuel_remaining_pct": float(self.fuel),
+                        "backup_fuel_pct": float(max(0.0, min(100.0, backup_pct))),
+                        "emergency_fuel_pct": float(max(0.0, min(100.0, emergency_pct))),
+                        "mission_progress": float(self.mission_progress),
+                        "summary": summary
+                    }
+                })
 
     async def update_db_objectives(self, status: str):
         if connection.SessionLocal:
@@ -639,6 +1335,7 @@ class SpacecraftSimulator:
         for idx, event in enumerate(self.active_events):
             event_type = event["event_type"]
             status = event.get("status", "ACTIVE")
+            prop_speed = event.get("propagation_speed", 1.0)
             
             # Mitigation timers execution
             if status == "MITIGATING":
@@ -650,75 +1347,163 @@ class SpacecraftSimulator:
             else:
                 damage_scale = 1.0
 
-            # 1. Fuel Leak
-            if event_type == "Fuel Leak":
-                affected_subsystems.add("Propulsion")
-                self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 1.2 * diff_factor * damage_scale * dt)
-                leak_rate = 0.3 * diff_factor * damage_scale
-                self.fuel = max(0.0, self.fuel - leak_rate * dt)
+            # Dynamic impact multipliers application from Phase 2.8 Custom / Templates
+            impact_mults = event.get("impact_multipliers", {})
+            if isinstance(impact_mults, str):
+                try:
+                    impact_mults = json.loads(impact_mults)
+                except:
+                    impact_mults = {}
             
-            # 2. Power Fluctuation
-            elif event_type == "Power Fluctuation":
-                affected_subsystems.add("Power")
-                affected_subsystems.add("Navigation")
-                self.subsystems["Power"]["health"] = max(0.0, self.subsystems["Power"]["health"] - 1.5 * diff_factor * damage_scale * dt)
-                self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 0.5 * diff_factor * damage_scale * dt)
-                
-                self.power_decay_time += dt
-                decay_lambda = 0.012 * diff_factor * damage_scale
-                self.power = max(10.0, self.power_decay_start * math.exp(-decay_lambda * self.power_decay_time))
-            
-            # 3. Solar Storm
-            elif event_type == "Solar Storm":
-                affected_subsystems.add("Power")
-                affected_subsystems.add("Communication")
-                self.subsystems["Power"]["health"] = max(0.0, self.subsystems["Power"]["health"] - 2.0 * diff_factor * damage_scale * dt)
-                self.subsystems["Communication"]["health"] = max(0.0, self.subsystems["Communication"]["health"] - 2.5 * diff_factor * damage_scale * dt)
-                
-                self.power_decay_time += dt
-                decay_lambda = 0.012 * diff_factor * damage_scale
-                self.power = max(10.0, self.power_decay_start * math.exp(-decay_lambda * self.power_decay_time))
-                has_active_comm_fail = True
+            if impact_mults:
+                for var, val in impact_mults.items():
+                    # val is generally negative for decays
+                    decay_rate = val * diff_factor * damage_scale * prop_speed * dt
+                    if var == "fuel":
+                        # Convert percentage decrement to mass decrement
+                        mass_deduct = (abs(decay_rate) / 100.0) * self.fuel_capacity
+                        # Deduct from physical tanks using active draw sequence
+                        rem_consumption = mass_deduct
+                        emergency_triggered = (self.risk_score > 50.0) or \
+                                               any(e.get("status") == "MITIGATING" for e in self.active_events) or \
+                                               (self.state == "Emergency")
+                        backup_triggered = any(e["event_type"] in ["Fuel Leak", "Navigation Drift", "Sensor Malfunction", "Trajectory Deviation", "Position Estimation Error"] for e in self.active_events)
+                        if emergency_triggered:
+                            draw_order = ["emergency", "backup", "main"]
+                        elif backup_triggered:
+                            draw_order = ["backup", "main", "emergency"]
+                        else:
+                            draw_order = ["main", "backup", "emergency"]
 
-            # 4. Communication Loss
-            elif event_type == "Communication Loss":
-                affected_subsystems.add("Communication")
-                self.subsystems["Communication"]["health"] = max(0.0, self.subsystems["Communication"]["health"] - 1.8 * diff_factor * damage_scale * dt)
-                has_active_comm_fail = True
+                        for tank in draw_order:
+                            if rem_consumption <= 0:
+                                break
+                            if tank == "main":
+                                if self.main_fuel > 0:
+                                    deduct = min(self.main_fuel, rem_consumption)
+                                    self.main_fuel -= deduct
+                                    rem_consumption -= deduct
+                            elif tank == "backup":
+                                if self.backup_fuel > 0:
+                                    deduct = min(self.backup_fuel, rem_consumption)
+                                    self.backup_fuel -= deduct
+                                    rem_consumption -= deduct
+                            elif tank == "emergency":
+                                if self.emergency_fuel > 0:
+                                    deduct = min(self.emergency_fuel, rem_consumption)
+                                    self.emergency_fuel -= deduct
+                                    rem_consumption -= deduct
+                        self.fuel_mass = max(0.0, self.main_fuel + self.backup_fuel + self.emergency_fuel)
+                        self.fuel = (self.fuel_mass / self.fuel_capacity) * 100.0
+                        affected_subsystems.add("Propulsion")
+                    elif var == "power":
+                        self.power = max(10.0, self.power + decay_rate)
+                        affected_subsystems.add("Power")
+                    elif var == "oxygen":
+                        self.oxygen = max(0.0, self.oxygen + decay_rate)
+                        affected_subsystems.add("Life Support")
+                    elif var == "health":
+                        self.health = max(0.0, self.health + decay_rate)
+                    elif var == "position_error":
+                        self.position_error = max(0.0, self.position_error + abs(decay_rate))
+                        affected_subsystems.add("Navigation")
+                    elif var == "temperature":
+                        self.temperature = max(-100.0, min(150.0, self.temperature + decay_rate))
+                        affected_subsystems.add("Thermal Control")
+                    elif var == "velocity":
+                        self.velocity = max(0.0, self.velocity + decay_rate)
+                        affected_subsystems.add("Propulsion")
+                    elif var.startswith("subsystems."):
+                        sub_name = var.split(".")[1]
+                        if sub_name in self.subsystems:
+                            self.subsystems[sub_name]["health"] = max(0.0, self.subsystems[sub_name]["health"] + decay_rate)
+                            affected_subsystems.add(sub_name)
+            else:
+                # Fallback to hardcoded events mapping
+                if event_type == "Fuel Leak":
+                    affected_subsystems.add("Propulsion")
+                    self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 1.2 * diff_factor * damage_scale * dt)
+                    leak_rate = 0.3 * diff_factor * damage_scale
+                    
+                    # Convert percentage leak rate to mass decrement in kg
+                    mass_deduct = (leak_rate * dt / 100.0) * self.fuel_capacity
+                    rem_consumption = mass_deduct
+                    emergency_triggered = (self.risk_score > 50.0) or \
+                                           any(e.get("status") == "MITIGATING" for e in self.active_events) or \
+                                           (self.state == "Emergency")
+                    backup_triggered = any(e["event_type"] in ["Fuel Leak", "Navigation Drift", "Sensor Malfunction", "Trajectory Deviation", "Position Estimation Error"] for e in self.active_events)
+                    if emergency_triggered:
+                        draw_order = ["emergency", "backup", "main"]
+                    elif backup_triggered:
+                        draw_order = ["backup", "main", "emergency"]
+                    else:
+                        draw_order = ["main", "backup", "emergency"]
 
-            # 5. Radiation Burst
-            elif event_type == "Radiation Burst":
-                affected_subsystems.add("Life Support")
-                affected_subsystems.add("Science Systems")
-                self.subsystems["Life Support"]["health"] = max(0.0, self.subsystems["Life Support"]["health"] - 1.5 * diff_factor * damage_scale * dt)
-                self.subsystems["Science Systems"]["health"] = max(0.0, self.subsystems["Science Systems"]["health"] - 1.2 * diff_factor * damage_scale * dt)
-
-            # 6. Navigation Drift
-            elif event_type == "Navigation Drift":
-                affected_subsystems.add("Navigation")
-                self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 1.5 * diff_factor * damage_scale * dt)
-                self.position_error += random.uniform(0.2, 0.6) * diff_factor * damage_scale * dt
-                self.angular_velocity["x"] += random.uniform(-0.01, 0.01) * dt
-                self.angular_velocity["y"] += random.uniform(-0.01, 0.01) * dt
-
-            # 7. Thruster Failure
-            elif event_type == "Thruster Failure":
-                affected_subsystems.add("Propulsion")
-                self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 2.5 * diff_factor * damage_scale * dt)
-                self.a *= 0.5
-                self.angular_velocity["z"] += random.uniform(-0.02, 0.02) * dt
-
-            # 8. Micrometeorite Impact
-            elif event_type == "Micrometeorite Impact":
-                affected_subsystems.add("Thermal Control")
-                affected_subsystems.add("Propulsion")
-                self.subsystems["Thermal Control"]["health"] = max(0.0, self.subsystems["Thermal Control"]["health"] - 3.0 * diff_factor * damage_scale * dt)
-                self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 1.0 * diff_factor * damage_scale * dt)
-
-            # 9. Sensor Malfunction
-            elif event_type == "Sensor Malfunction":
-                affected_subsystems.add("Navigation")
-                self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 1.2 * diff_factor * damage_scale * dt)
+                    for tank in draw_order:
+                        if rem_consumption <= 0:
+                            break
+                        if tank == "main":
+                            if self.main_fuel > 0:
+                                deduct = min(self.main_fuel, rem_consumption)
+                                self.main_fuel -= deduct
+                                rem_consumption -= deduct
+                        elif tank == "backup":
+                            if self.backup_fuel > 0:
+                                deduct = min(self.backup_fuel, rem_consumption)
+                                self.backup_fuel -= deduct
+                                rem_consumption -= deduct
+                        elif tank == "emergency":
+                            if self.emergency_fuel > 0:
+                                deduct = min(self.emergency_fuel, rem_consumption)
+                                self.emergency_fuel -= deduct
+                                rem_consumption -= deduct
+                    self.fuel_mass = max(0.0, self.main_fuel + self.backup_fuel + self.emergency_fuel)
+                    self.fuel = (self.fuel_mass / self.fuel_capacity) * 100.0
+                elif event_type == "Power Fluctuation":
+                    affected_subsystems.add("Power")
+                    affected_subsystems.add("Navigation")
+                    self.subsystems["Power"]["health"] = max(0.0, self.subsystems["Power"]["health"] - 1.5 * diff_factor * damage_scale * dt)
+                    self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 0.5 * diff_factor * damage_scale * dt)
+                    self.power_decay_time += dt
+                    decay_lambda = 0.012 * diff_factor * damage_scale
+                    self.power = max(10.0, self.power_decay_start * math.exp(-decay_lambda * self.power_decay_time))
+                elif event_type == "Solar Storm":
+                    affected_subsystems.add("Power")
+                    affected_subsystems.add("Communication")
+                    self.subsystems["Power"]["health"] = max(0.0, self.subsystems["Power"]["health"] - 2.0 * diff_factor * damage_scale * dt)
+                    self.subsystems["Communication"]["health"] = max(0.0, self.subsystems["Communication"]["health"] - 2.5 * diff_factor * damage_scale * dt)
+                    self.power_decay_time += dt
+                    decay_lambda = 0.012 * diff_factor * damage_scale
+                    self.power = max(10.0, self.power_decay_start * math.exp(-decay_lambda * self.power_decay_time))
+                    has_active_comm_fail = True
+                elif event_type == "Communication Loss":
+                    affected_subsystems.add("Communication")
+                    self.subsystems["Communication"]["health"] = max(0.0, self.subsystems["Communication"]["health"] - 1.8 * diff_factor * damage_scale * dt)
+                    has_active_comm_fail = True
+                elif event_type == "Radiation Burst":
+                    affected_subsystems.add("Life Support")
+                    affected_subsystems.add("Science Systems")
+                    self.subsystems["Life Support"]["health"] = max(0.0, self.subsystems["Life Support"]["health"] - 1.5 * diff_factor * damage_scale * dt)
+                    self.subsystems["Science Systems"]["health"] = max(0.0, self.subsystems["Science Systems"]["health"] - 1.2 * diff_factor * damage_scale * dt)
+                elif event_type == "Navigation Drift":
+                    affected_subsystems.add("Navigation")
+                    self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 1.5 * diff_factor * damage_scale * dt)
+                    self.position_error += random.uniform(0.2, 0.6) * diff_factor * damage_scale * dt
+                    self.angular_velocity["x"] += random.uniform(-0.01, 0.01) * dt
+                    self.angular_velocity["y"] += random.uniform(-0.01, 0.01) * dt
+                elif event_type == "Thruster Failure":
+                    affected_subsystems.add("Propulsion")
+                    self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 2.5 * diff_factor * damage_scale * dt)
+                    self.a *= 0.5
+                    self.angular_velocity["z"] += random.uniform(-0.02, 0.02) * dt
+                elif event_type == "Micrometeorite Impact":
+                    affected_subsystems.add("Thermal Control")
+                    affected_subsystems.add("Propulsion")
+                    self.subsystems["Thermal Control"]["health"] = max(0.0, self.subsystems["Thermal Control"]["health"] - 3.0 * diff_factor * damage_scale * dt)
+                    self.subsystems["Propulsion"]["health"] = max(0.0, self.subsystems["Propulsion"]["health"] - 1.0 * diff_factor * damage_scale * dt)
+                elif event_type == "Sensor Malfunction":
+                    affected_subsystems.add("Navigation")
+                    self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 1.2 * diff_factor * damage_scale * dt)
 
         # Apply self-repair to inactive systems (0.2% health recovery per tick)
         for sub_name in self.subsystems:
@@ -736,17 +1521,24 @@ class SpacecraftSimulator:
             )
 
         # Consequence failure propagation cascades
-        # A. Low propulsion health -> Thruster Failure
+        # A. Propulsion degradation -> Thruster Failure
         if self.subsystems["Propulsion"]["health"] < 30.0 and not any(e["event_type"] == "Thruster Failure" for e in self.active_events):
             await self.trigger_cascade_event("Thruster Failure", "Propulsion degradation triggers asymmetric thruster feedback failure.")
             
-        # B. Low power health -> Power Fluctuation & degrades Comm/Nav
+        # B. Power degradation -> Power Fluctuation & degrades Comm/Nav
         if self.subsystems["Power"]["health"] < 30.0:
             if not any(e["event_type"] == "Power Fluctuation" for e in self.active_events):
                 await self.trigger_cascade_event("Power Fluctuation", "Critical power grid depletion triggers systemic voltage oscillations.")
-            # Drain Comm and Nav systems by 0.5% per tick
             self.subsystems["Communication"]["health"] = max(0.0, self.subsystems["Communication"]["health"] - 0.5 * dt)
             self.subsystems["Navigation"]["health"] = max(0.0, self.subsystems["Navigation"]["health"] - 0.5 * dt)
+
+        # C. Navigation degradation -> Position Estimation Error / Nav Drift
+        if self.subsystems["Navigation"]["health"] < 30.0 and not any(e["event_type"] == "Position Estimation Error" for e in self.active_events):
+            await self.trigger_cascade_event("Position Estimation Error", "Critical navigation systems failure induces high Kalman filter drift.")
+
+        # D. Life Support degradation -> Pressure Loss
+        if self.subsystems["Life Support"]["health"] < 30.0 and not any(e["event_type"] == "Pressure Loss" for e in self.active_events):
+            await self.trigger_cascade_event("Pressure Loss", "Structural microfractures trigger localized cabin compartment decompression.")
 
         # Comm status tracking
         if has_active_comm_fail or self.subsystems["Communication"]["health"] < 30.0:
@@ -773,12 +1565,13 @@ class SpacecraftSimulator:
         if connection.SessionLocal:
             try:
                 async with connection.SessionLocal() as db:
+                    from backend.database.models import MissionEventModel
                     db_event = MissionEventModel(
                         event_type=event_type,
                         severity="HIGH",
                         timestamp=datetime.utcnow(),
                         description=description,
-                        affected_system="Propulsion" if event_type == "Thruster Failure" else "Electrical Systems",
+                        affected_system="Propulsion" if event_type in ["Thruster Failure", "Engine Failure"] else "Electrical Systems",
                         probability=1.0,
                         recommended_actions="Perform emergency system bypass.",
                         resolved=False
@@ -794,7 +1587,8 @@ class SpacecraftSimulator:
         if connection.SessionLocal and db_event_id:
             try:
                 async with connection.SessionLocal() as db:
-                    parent_type = "Fuel Leak" if event_type == "Thruster Failure" else "Solar Storm"
+                    from backend.database.models import EventDependencyModel
+                    parent_type = "Fuel Leak" if event_type in ["Thruster Failure", "Engine Failure"] else "Solar Storm"
                     dep = EventDependencyModel(
                         parent_event_type=parent_type,
                         child_event_type=event_type,
@@ -805,24 +1599,127 @@ class SpacecraftSimulator:
             except Exception as e:
                 print(f"[DB ERROR] Dependency link failed: {e}")
 
-        self.active_events.append({
-            "id": db_event_id,
+        # Formulate root causes
+        root_causes = [description]
+        
+        new_event = {
+            "id": db_event_id or random.randint(10000, 99999),
             "event_type": event_type,
             "severity": "HIGH",
             "description": description,
-            "affected_system": "Propulsion" if event_type == "Thruster Failure" else "Electrical Systems",
+            "affected_system": "Propulsion" if event_type in ["Thruster Failure", "Engine Failure"] else "Electrical Systems",
             "recommended_actions": "Activate backup Attitude Controller." if event_type == "Thruster Failure" else "Divert Deflectors.",
             "duration": random.uniform(20.0, 40.0),
-            "status": "ACTIVE"
+            "status": "ACTIVE",
+            "propagation_speed": 1.0,
+            "probability": 1.0,
+            "impact_multipliers": "{}",
+            "trigger_time": 0.0,
+            "root_causes": root_causes,
+            "selected_root_cause": root_causes[0]
+        }
+        self.active_events.append(new_event)
+        
+        # Track timing
+        self.recovery_start_times[new_event["id"]] = datetime.utcnow().timestamp()
+        self.recovery_initial_metrics[new_event["id"]] = {
+            "fuel": self.fuel,
+            "power": self.power,
+            "oxygen": self.oxygen,
+            "health": self.health,
+            "success_probability": self.success_probability,
+            "risk_score": self.risk_score
+        }
+
+        # Broadcast WS Anomaly Injected for cascaded event
+        await manager.broadcast_json({
+            "type": "Anomaly Injected",
+            "event_id": new_event["id"],
+            "event_type": event_type,
+            "severity": "HIGH",
+            "system": new_event["affected_system"]
         })
 
     async def resolve_active_event(self, event: Dict[str, Any]):
         event_type = event["event_type"]
+        e_id = event["id"]
         await self.log_event("INFO", f"Anomaly resolved: {event_type}")
+
+        # Update Trajectory Planner active events on resolution
+        mapped_event = None
+        if event_type == "Fuel Leak":
+            mapped_event = "fuel_leak"
+        elif event_type == "Thruster Failure":
+            mapped_event = "thruster_failure"
+        elif event_type == "Navigation Drift":
+            mapped_event = "navigation_drift"
+
+        if mapped_event:
+            try:
+                from backend.trajectory.planner import TrajectoryPlanner
+                from backend.database.connection import SessionLocal
+                from backend.database.models import DestinationModel
+                from sqlalchemy import select
+
+                planner = await TrajectoryPlanner.load_from_redis()
+                if mapped_event in planner.active_events:
+                    planner.active_events.remove(mapped_event)
+                    await planner.save_to_redis()
+                    if SessionLocal:
+                        async with SessionLocal() as db_session:
+                            stmt = select(DestinationModel).where(DestinationModel.name == planner.destination)
+                            res_db = await db_session.execute(stmt)
+                            dest_row = res_db.scalars().first()
+                            if dest_row:
+                                outputs = planner.calculate(dest_row.avg_distance_km)
+                                await manager.broadcast_json({
+                                    "type": "TRAJECTORY_UPDATE",
+                                    "data": {
+                                        "inputs": planner.to_dict(),
+                                        "outputs": outputs
+                                    }
+                                })
+            except Exception as ex:
+                print(f"[Trajectory Hook Error] Failed to update resolved event in planner: {ex}")
+
+        # Compute recovery metrics
+        now_ts = datetime.utcnow().timestamp()
+        detect_t = 1.5  # default/mock detection delay seconds
+        rec_t = 5.0     # default/mock recovery duration seconds
+        
+        if e_id in self.recovery_start_times:
+            rec_t = round(now_ts - self.recovery_start_times[e_id], 1)
+            
+        initials = self.recovery_initial_metrics.get(e_id, {})
+        init_health = initials.get("health", 100.0)
+        damage_sustained = max(0.0, init_health - self.health)
+        damage_prev = round(max(0.0, 25.0 - damage_sustained), 1)
+        
+        success_change = round(self.success_probability - initials.get("success_probability", 80.0), 1)
+        risk_red = round(initials.get("risk_score", 0.0) - self.risk_score, 1)
+        resource_pres = round(self.fuel - initials.get("fuel", self.fuel), 1)
+
+        # Update global recovery efficiency running average
+        prev_eff = self.recovery_efficiency
+        new_eff = max(0.0, min(100.0, (damage_prev / 25.0) * 100.0))
+        self.recovery_efficiency = round(0.7 * prev_eff + 0.3 * new_eff, 1)
 
         if connection.SessionLocal:
             try:
                 async with connection.SessionLocal() as db:
+                    from backend.database.models import RecoveryMetricsModel
+                    metric = RecoveryMetricsModel(
+                        scenario_id=self.active_scenario["id"] if self.active_scenario else None,
+                        timestamp=datetime.utcnow(),
+                        detection_time=detect_t,
+                        recovery_time=rec_t,
+                        damage_prevented=damage_prev,
+                        mission_success_change=success_change,
+                        risk_reduction=risk_red,
+                        resource_preservation=resource_pres
+                    )
+                    db.add(metric)
+                    
                     stmt = (
                         update(MissionEventModel)
                         .where(MissionEventModel.id == event["id"])
@@ -842,7 +1739,19 @@ class SpacecraftSimulator:
                         
                     await db.commit()
             except Exception as e:
-                print(f"[DB ERROR] Anomaly resolution save failed: {e}")
+                print(f"[DB ERROR] Anomaly resolution metrics save failed: {e}")
+
+        # Update Redis recovery cache
+        try:
+            redis = await get_redis()
+            await redis.set("hail_mary:test:recovery_metrics", json.dumps({
+                "detection_time": detect_t,
+                "recovery_time": rec_t,
+                "damage_prevented": damage_prev,
+                "risk_reduction": risk_red
+            }))
+        except Exception as e:
+            print(f"[Redis ERROR] Recovery metrics caching failed: {e}")
 
         if event_type in ["Power Fluctuation", "Solar Storm"]:
             self.power_decay_start = self.power
@@ -851,6 +1760,14 @@ class SpacecraftSimulator:
         if not any(e["event_type"] in ["Power Fluctuation", "Solar Storm"] for e in self.active_events):
             self.power = min(100.0, self.power + 5.0)
 
+        # Broadcast WS events
+        await manager.broadcast_json({
+            "type": "Recovery Completed",
+            "event_id": e_id,
+            "event_type": event_type,
+            "recovery_time": rec_t
+        })
+        
         await manager.broadcast_json({
             "type": "EVENT_RESOLVED",
             "event_id": event["id"],
@@ -858,202 +1775,15 @@ class SpacecraftSimulator:
         })
 
     async def check_event_generator(self, dt: float):
-        if self.event_timer >= self.next_event_time:
-            self.event_timer = 0.0
-            self.next_event_time = self.get_randomized_event_time()
-            await self.generate_random_event()
+        # DISABLED: Automatic event generation removed.
+        # Anomalies are only created via manual user injection.
+        pass
 
     async def generate_random_event(self):
-        weights = {
-            "Solar Storm": 0.05,
-            "Fuel Leak": 0.08,
-            "Thruster Failure": 0.04,
-            "Communication Loss": 0.06,
-            "Radiation Burst": 0.05,
-            "Sensor Malfunction": 0.10,
-            "Power Fluctuation": 0.12,
-            "Navigation Drift": 0.08,
-            "Micrometeorite Impact": 0.03,
-            "Unknown Object Detection": 0.02,
-            "Routine Status Update": 0.37
-        }
+        # DISABLED: Automatic event generation removed.
+        # Anomalies are only created via manual user injection.
+        return
 
-        # Apply state thresholds offsets
-        if self.fuel < 35.0:
-            weights["Fuel Leak"] *= 3.0
-            weights["Thruster Failure"] *= 2.0
-            weights["Routine Status Update"] *= 0.5
-        if self.power < 35.0:
-            weights["Power Fluctuation"] *= 3.0
-            weights["Communication Loss"] *= 2.0
-            weights["Routine Status Update"] *= 0.5
-        if self.health < 50.0:
-            weights["Micrometeorite Impact"] *= 3.0
-            weights["Sensor Malfunction"] *= 2.0
-            weights["Routine Status Update"] *= 0.5
-
-        total_weight = sum(weights.values())
-        norm_weights = {k: v / total_weight for k, v in weights.items()}
-
-        keys = list(norm_weights.keys())
-        probabilities = list(norm_weights.values())
-        picked_event_type = random.choices(keys, weights=probabilities, k=1)[0]
-
-        if picked_event_type != "Routine Status Update" and any(e["event_type"] == picked_event_type for e in self.active_events):
-            picked_event_type = "Routine Status Update"
-
-        severity_levels = {
-            "Routine Status Update": "INFO",
-            "Unknown Object Detection": "INFO",
-            "Sensor Malfunction": "LOW",
-            "Navigation Drift": "LOW",
-            "Power Fluctuation": "MEDIUM",
-            "Radiation Burst": "MEDIUM",
-            "Fuel Leak": "HIGH",
-            "Thruster Failure": "HIGH",
-            "Communication Loss": "HIGH",
-            "Solar Storm": "CRITICAL",
-            "Micrometeorite Impact": "CRITICAL"
-        }
-
-        descriptions = {
-            "Solar Storm": "Solar CME particles interacting with hull panels. Inducing electromagnetic discharges.",
-            "Fuel Leak": "Propellant pressure drops detected on Port tank valves. Slow propellant loss active.",
-            "Thruster Failure": "Asymmetrical RCS nozzles feedback failure. Thruster force reduced.",
-            "Communication Loss": "S-Band High Gain Antenna experiences carrier signal synchronization loss.",
-            "Radiation Burst": "Solar flare event emitting alpha particles. Shield armor experiencing stress.",
-            "Sensor Malfunction": "Optical sensor occlusion. Telemetry reading variances suspected.",
-            "Power Fluctuation": "Solar cells experience transient grid discharge. Battery voltage drops.",
-            "Navigation Drift": "IMU drift introduces coordinate discrepancy calculations.",
-            "Micrometeorite Impact": "Minor micro-impact registered on rear thruster bell shell.",
-            "Unknown Object Detection": "LIDAR reflections register localized mass orbiting nearby.",
-            "Routine Status Update": "Spacecraft sub-systems report normal telemetry operations."
-        }
-
-        affected_systems = {
-            "Solar Storm": "Electrical Systems",
-            "Fuel Leak": "Propulsion",
-            "Thruster Failure": "Propulsion",
-            "Communication Loss": "Communications",
-            "Radiation Burst": "Structural Armor",
-            "Sensor Malfunction": "Nav Computers",
-            "Power Fluctuation": "Electrical Systems",
-            "Navigation Drift": "Nav Computers",
-            "Micrometeorite Impact": "Structural Armor",
-            "Unknown Object Detection": "Nav Computers",
-            "Routine Status Update": "Diagnostics"
-        }
-
-        actions = {
-            "Solar Storm": "Retract secondary solar panels. Set deflectors.",
-            "Fuel Leak": "Activate auxiliary backup tank.",
-            "Thruster Failure": "Re-vector gimbal bells attitude controller.",
-            "Communication Loss": "Initiate automated S-band sweeps.",
-            "Radiation Burst": "Activate carbon shielding divert deflection grid.",
-            "Sensor Malfunction": "Calibrate IMU sensor alignments.",
-            "Power Fluctuation": "Bypass compromised lines and scan diagnostics.",
-            "Navigation Drift": "Perform star-field overlay coordinates sync.",
-            "Micrometeorite Impact": "Seal bulkhead pressure chambers.",
-            "Unknown Object Detection": "Acquire scans trajectory data.",
-            "Routine Status Update": "No immediate actions required."
-        }
-
-        severity = severity_levels[picked_event_type]
-        if self.difficulty == "Extreme" and severity != "CRITICAL":
-            severity = {"INFO": "LOW", "LOW": "MEDIUM", "MEDIUM": "HIGH", "HIGH": "CRITICAL"}[severity]
-
-        description = descriptions[picked_event_type]
-        affected_system = affected_systems[picked_event_type]
-        recommended_action = actions[picked_event_type]
-        prob_val = norm_weights[picked_event_type]
-
-        # Apply instant impact effects
-        if picked_event_type == "Fuel Leak":
-            self.fuel = max(0.0, self.fuel - random.uniform(5.0, 10.0))
-        elif picked_event_type == "Thruster Failure":
-            self.velocity *= 0.85
-        elif picked_event_type == "Radiation Burst":
-            self.subsystems["Life Support"]["health"] = max(0.0, self.subsystems["Life Support"]["health"] - random.uniform(5.0, 15.0))
-        elif picked_event_type == "Micrometeorite Impact":
-            self.subsystems["Thermal Control"]["health"] = max(0.0, self.subsystems["Thermal Control"]["health"] - random.uniform(8.0, 20.0))
-            self.angular_velocity["x"] = random.uniform(-0.1, 0.1)
-            self.angular_velocity["y"] = random.uniform(-0.1, 0.1)
-
-        await self.log_event(severity, f"EVENT TRIGGERED: {picked_event_type} - {description}")
-
-        db_event_id = None
-        if connection.SessionLocal:
-            try:
-                async with connection.SessionLocal() as db:
-                    db_event = MissionEventModel(
-                        event_type=picked_event_type,
-                        severity=severity,
-                        timestamp=datetime.utcnow(),
-                        description=description,
-                        affected_system=affected_system,
-                        probability=prob_val,
-                        recommended_actions=recommended_action,
-                        resolved=(severity == "INFO")
-                    )
-                    db.add(db_event)
-                    await db.flush()
-                    db_event_id = db_event.id
-                    await db.commit()
-            except Exception as e:
-                print(f"[DB ERROR] Event capture write failed: {e}")
-
-        # If not simple informational message, append to active events list with status PENDING
-        if severity != "INFO":
-            event_duration = random.uniform(20.0, 45.0)
-            
-            # Formulate Failure Tree options causes dynamically
-            root_causes = {
-                "Thruster Failure": ["Fuel Line Leaks", "Eductor Combustion Clog", "Control Electronics Fault", "Nozzle Gimbal Jam"],
-                "Solar Storm": ["CME Particle Stream Discharge", "Solar Wind Flare Charge"],
-                "Fuel Leak": ["Port Valve Gasket Microfracture", "Crossfeed Pipe Seam Crack"],
-                "Communication Loss": ["Transceiver Frequency Drift", "HG Waveguide Misalignment"],
-                "Navigation Drift": ["IMU Alignment Drift", "Optical Sensor Obstruction"],
-                "Power Fluctuation": ["Transformer Regulator Discharge", "Battery Cell Short Circuit"]
-            }.get(picked_event_type, ["Unknown telemetry failure source"])
-            
-            new_active_event = {
-                "id": db_event_id,
-                "event_type": picked_event_type,
-                "severity": severity,
-                "description": description,
-                "affected_system": affected_system,
-                "recommended_actions": recommended_action,
-                "duration": event_duration,
-                "status": "PENDING" if picked_event_type == "Solar Storm" else "ACTIVE",
-                "mitigation_timer": 0.0,
-                "chosen_action": None,
-                "root_causes": root_causes,
-                "selected_root_cause": random.choice(root_causes)
-            }
-            self.active_events.append(new_active_event)
-            
-            if picked_event_type in ["Power Fluctuation", "Solar Storm"]:
-                self.power_decay_start = self.power
-                self.power_decay_time = 0.0
-
-            redis = await get_redis()
-            await redis.set("hail_mary:active_events", json.dumps([
-                {k: v for k, v in ev.items() if k not in ["duration", "mitigation_timer"]} 
-                for ev in self.active_events
-            ]))
-
-            await manager.broadcast_json({
-                "type": "NEW_EVENT",
-                "event": {
-                    "id": db_event_id,
-                    "event_type": picked_event_type,
-                    "severity": severity,
-                    "description": description,
-                    "affected_system": affected_system,
-                    "recommended_actions": recommended_action,
-                    "status": new_active_event["status"]
-                }
-            })
 
     async def calculate_success_scores(self):
         # Feature 4 Success Prediction Model
@@ -1099,17 +1829,12 @@ class SpacecraftSimulator:
         await redis.set("hail_mary:risk_score", str(self.risk_score))
 
         if connection.SessionLocal:
-            try:
-                async with connection.SessionLocal() as db:
-                    risk_rec = RiskHistoryModel(
-                        timestamp=datetime.utcnow(),
-                        risk_score=self.risk_score,
-                        risk_level=self.risk_level
-                    )
-                    db.add(risk_rec)
-                    await db.commit()
-            except Exception as e:
-                print(f"[DB ERROR] Risk history write failed: {e}")
+            risk_rec = RiskHistoryModel(
+                timestamp=datetime.utcnow(),
+                risk_score=self.risk_score,
+                risk_level=self.risk_level
+            )
+            self.risk_write_buffer.append(risk_rec)
 
     async def save_state_to_storages(self):
         telemetry = self.get_telemetry_data()
@@ -1117,48 +1842,34 @@ class SpacecraftSimulator:
 
         redis = await get_redis()
         await redis.set("hail_mary:telemetry", telemetry.model_dump_json())
+        await redis.set("hail_mary:mission", mission.model_dump_json())
 
         if connection.SessionLocal:
-            try:
-                async with connection.SessionLocal() as db:
-                    # Update active MissionModel details
-                    stmt = select(MissionModel).limit(1)
-                    result = await db.execute(stmt)
-                    db_mission = result.scalars().first()
-                    if db_mission:
-                        db_mission.state = mission.state
-                        db_mission.duration = mission.duration
-                        db_mission.launch_time = self.launch_time if self.launch_time else db_mission.launch_time
-                    
-                    # Store historical telemetry
-                    db_telemetry = TelemetryModel(
-                        timestamp=datetime.utcnow(),
-                        fuel=telemetry.fuel,
-                        power=telemetry.power,
-                        oxygen=telemetry.oxygen,
-                        temperature=telemetry.temperature,
-                        health=telemetry.health,
-                        velocity=telemetry.velocity,
-                        distance=telemetry.distance,
-                        mission_progress=telemetry.mission_progress
-                    )
-                    db.add(db_telemetry)
-                    
-                    # Store subsystem health logs
-                    for sub_name, sub_data in self.subsystems.items():
-                        sub_log = SubsystemHealthModel(
-                            timestamp=datetime.utcnow(),
-                            subsystem_name=sub_name,
-                            health=sub_data["health"],
-                            status=sub_data["status"],
-                            risk_score=sub_data["risk"],
-                            performance=sub_data["performance"]
-                        )
-                        db.add(sub_log)
-
-                    await db.commit()
-            except Exception as e:
-                print(f"[DB ERROR] Simulator state write failed: {e}")
+            # Store historical telemetry to buffer
+            db_telemetry = TelemetryModel(
+                timestamp=datetime.utcnow(),
+                fuel=telemetry.fuel,
+                power=telemetry.power,
+                oxygen=telemetry.oxygen,
+                temperature=telemetry.temperature,
+                health=telemetry.health,
+                velocity=telemetry.velocity,
+                distance=telemetry.distance,
+                mission_progress=telemetry.mission_progress
+            )
+            self.telemetry_write_buffer.append(db_telemetry)
+            
+            # Store subsystem health logs to buffer
+            for sub_name, sub_data in self.subsystems.items():
+                sub_log = SubsystemHealthModel(
+                    timestamp=datetime.utcnow(),
+                    subsystem_name=sub_name,
+                    health=sub_data["health"],
+                    status=sub_data["status"],
+                    risk_score=sub_data["risk"],
+                    performance=sub_data["performance"]
+                )
+                self.subsystem_write_buffer.append(sub_log)
 
     async def append_snapshot_memory(self):
         # Record snapshots to memory cache for playback replays
@@ -1180,37 +1891,116 @@ class SpacecraftSimulator:
         }
         self.mission_history.append(snapshot)
         
-        # Save running snapshots to DB logs table
+        # Save running snapshots to DB logs table buffer
         if connection.SessionLocal:
-            try:
-                async with connection.SessionLocal() as db:
-                    mem_rec = MissionMemoryModel(
-                        timestamp=datetime.utcnow(),
-                        telemetry_snapshot=telemetry.model_dump_json(),
-                        active_events=json.dumps([e["event_type"] for e in self.active_events]),
-                        available_actions=json.dumps([a["action_key"] for e in self.active_events for a in self.action_options.get(e["event_type"], [])]),
-                        chosen_action=None,
-                        outcome=None
-                    )
-                    db.add(mem_rec)
-                    await db.commit()
-            except Exception as e:
-                print(f"[DB ERROR] Memory write failed: {e}")
+            mem_rec = MissionMemoryModel(
+                timestamp=datetime.utcnow(),
+                telemetry_snapshot=telemetry.model_dump_json(),
+                active_events=json.dumps([e["event_type"] for e in self.active_events]),
+                available_actions=json.dumps([a["action_key"] for e in self.active_events for a in self.action_options.get(e["event_type"], [])]),
+                chosen_action=None,
+                outcome=None
+            )
+            self.memory_write_buffer.append(mem_rec)
 
     async def broadcast_telemetry(self):
         telemetry = self.get_telemetry_data()
         mission = self.get_mission_info()
         
-        payload = {
-            "type": "TELEMETRY",
-            "mission": mission.model_dump(),
-            "telemetry": telemetry.model_dump(),
-            "active_events": [
-                {k: v for k, v in ev.items() if k not in ["duration", "mitigation_timer"]} 
-                for ev in self.active_events
-            ]
+        # 1. Always broadcast TELEMETRY_TICK
+        await manager.broadcast_json({
+            "type": "TELEMETRY_TICK",
+            "telemetry": telemetry.model_dump()
+        })
+        
+        # 2. Check if mission state changed
+        current_mission_state = {
+            "state": mission.state,
+            "duration": mission.duration,
+            "risk_score": mission.risk_score,
+            "risk_level": mission.risk_level
         }
-        await manager.broadcast_json(payload)
+        if current_mission_state != self.last_broadcast_state:
+            self.last_broadcast_state = current_mission_state
+            await manager.broadcast_json({
+                "type": "MISSION_STATE",
+                "mission": mission.model_dump()
+            })
+            
+        # 3. Check if active events list changed
+        current_events_hash = json.dumps([
+            {"id": ev["id"], "status": ev.get("status")} 
+            for ev in self.active_events
+        ], sort_keys=True)
+        
+        if current_events_hash != self.last_active_events_hash:
+            self.last_active_events_hash = current_events_hash
+            await manager.broadcast_json({
+                "type": "ACTIVE_EVENTS",
+                "active_events": [
+                    {k: v for k, v in ev.items() if k not in ["duration", "mitigation_timer"]} 
+                    for ev in self.active_events
+                ]
+            })
+
+    async def flush_buffers_to_db(self, force=False):
+        if not force and self.tick_counter % 10 != 0:
+            return
+
+        # Pop items to avoid thread race conditions
+        telemetry_items = self.telemetry_write_buffer
+        self.telemetry_write_buffer = []
+        
+        subsystem_items = self.subsystem_write_buffer
+        self.subsystem_write_buffer = []
+        
+        risk_items = self.risk_write_buffer
+        self.risk_write_buffer = []
+        
+        memory_items = self.memory_write_buffer
+        self.memory_write_buffer = []
+        
+        resilience_items = self.resilience_write_buffer
+        self.resilience_write_buffer = []
+        
+        if not (telemetry_items or subsystem_items or risk_items or memory_items or resilience_items or force):
+            return
+            
+        if not connection.SessionLocal:
+            return
+
+        async def do_flush():
+            try:
+                async with connection.SessionLocal() as db:
+                    # Update active MissionModel details
+                    mission = self.get_mission_info()
+                    stmt = select(MissionModel).limit(1)
+                    result = await db.execute(stmt)
+                    db_mission = result.scalars().first()
+                    if db_mission:
+                        db_mission.state = mission.state
+                        db_mission.duration = mission.duration
+                        db_mission.launch_time = self.launch_time if self.launch_time else db_mission.launch_time
+                    
+                    if telemetry_items:
+                        db.add_all(telemetry_items)
+                    if subsystem_items:
+                        db.add_all(subsystem_items)
+                    if risk_items:
+                        db.add_all(risk_items)
+                    if memory_items:
+                        db.add_all(memory_items)
+                    if resilience_items:
+                        db.add_all(resilience_items)
+                        
+                    await db.commit()
+            except Exception as e:
+                print(f"[DB ERROR] Async batch write failed: {e}")
+
+        if force:
+            await do_flush()
+        else:
+            asyncio.create_task(do_flush())
 
     # --- DECISION SANDBOX EXECUTION HANDLER ---
     async def execute_action(self, event_id: int, action_key: str) -> Dict[str, Any]:
@@ -1231,8 +2021,19 @@ class SpacecraftSimulator:
 
         # Transition event status to MITIGATING
         target_event["status"] = "MITIGATING"
-        target_event["mitigation_timer"] = 5.0  # takes 5 simulation ticks to complete
+        target_event["mitigation_timer"] = 1.0  # takes 1 simulation tick to complete
         target_event["chosen_action"] = action_key
+        
+        # Record the decision or recovery action
+        action_record = {
+            "event": event_type,
+            "action": action_key,
+            "timestamp": ist_now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        if getattr(self, "agent_workflow_running", False):
+            self.agent_decisions.append(action_record)
+        else:
+            self.recovery_actions.append(action_record)
         
         # Fetch outcome predictions deltas
         deltas = self.action_predictions.get(action_key, {"fuel_delta": 0.0, "power_delta": 0.0, "risk_reduction": 0.0, "success_delta": 0.0})
@@ -1258,10 +2059,35 @@ class SpacecraftSimulator:
             except Exception as e:
                 print(f"[DB ERROR] Trace save failed: {e}")
 
+        # Record consensus
+        await self.record_consensus(event_type, action_key)
+
+        # Add to pending checks for 1 tick later verification
+        if not hasattr(self, 'pending_outcome_checks'):
+            self.pending_outcome_checks = []
+        self.pending_outcome_checks.append({
+            "ticks_remaining": 1,
+            "action_key": action_key,
+            "event_type": event_type,
+            "initial_success_probability": self.success_probability,
+            "initial_risk": self.risk_score,
+            "predicted_success_delta": deltas.get("success_delta", 0.0),
+            "predicted_success": min(100.0, max(0.0, self.success_probability + deltas.get("success_delta", 0.0))),
+            "state_snapshot": self.get_telemetry_data().model_dump_json(),
+            "active_events": json.dumps([e["event_type"] for e in self.active_events])
+        })
+
         # Broadcast update over WS
         await self.log_event("INFO", f"Sandbox Action Executed: '{action_key}' - Mitigating event: '{event_type}'.")
         await manager.broadcast_json({
             "type": "ACTION_EXECUTED",
+            "event_id": event_id,
+            "action_key": action_key,
+            "status": "MITIGATING",
+            "predictions_deltas": deltas
+        })
+        await manager.broadcast_json({
+            "type": "DECISION_EXECUTED",
             "event_id": event_id,
             "action_key": action_key,
             "status": "MITIGATING",
@@ -1328,6 +2154,681 @@ class SpacecraftSimulator:
         })
         
         return results
+
+    async def record_consensus(self, event_type: str, action_key: str):
+        if not connection.SessionLocal:
+            return
+        from backend.database.models import ConsensusRecordModel
+        # Specialists rating heuristics
+        nav_rating = 0.95 if "backup" in action_key or "revector" in action_key else 0.40
+        fuel_rating = 0.90 if "reduce_speed" in action_key or "shutdown" in action_key else 0.50
+        safety_rating = 0.95 if "shield" in action_key or "seal" in action_key or "divert" in action_key else 0.30
+        science_rating = 0.85 if "star_field" in action_key or "diagnostic" in action_key else 0.60
+        
+        pred_rating = 0.88
+        lrn_rating = 0.85
+        
+        consensus_score = (nav_rating + fuel_rating + safety_rating + science_rating + pred_rating + lrn_rating) / 6.0 * 100.0
+        
+        try:
+            async with connection.SessionLocal() as db:
+                rec = ConsensusRecordModel(
+                    timestamp=datetime.utcnow(),
+                    decision_key=f"{event_type}_{action_key}",
+                    nav_recommendation=f"Navigation: Suggests {action_key} (Rating: {nav_rating:.2f})",
+                    fuel_recommendation=f"Fuel: Suggests {action_key} (Rating: {fuel_rating:.2f})",
+                    safety_recommendation=f"Safety: Suggests {action_key} (Rating: {safety_rating:.2f})",
+                    science_recommendation=f"Science: Suggests {action_key} (Rating: {science_rating:.2f})",
+                    prediction_rating=pred_rating,
+                    learning_rating=lrn_rating,
+                    consensus_score=round(consensus_score, 1),
+                    commander_override=False
+                )
+                db.add(rec)
+                await db.commit()
+                
+                # Broadcast
+                await manager.broadcast_json({
+                    "type": "CONSENSUS_UPDATED",
+                    "consensus_score": round(consensus_score, 1),
+                    "decision_key": rec.decision_key
+                })
+        except Exception as e:
+            print(f"[Ops Center] Failed to write consensus log: {e}")
+
+    async def update_lifecycle_phase(self):
+        if not self.is_active or self.state in ["Completed", "Emergency"]:
+            return
+            
+        from backend.database.models import MissionTimelineModel
+        old_phase = self.state
+        progress = self.mission_progress
+        
+        if progress == 0.0:
+            new_phase = "Pre-Launch"
+        elif progress <= 5.0:
+            new_phase = "Launch"
+        elif progress <= 15.0:
+            new_phase = "Orbit Insertion"
+        elif progress <= 60.0:
+            new_phase = "Cruise"
+        elif progress <= 70.0:
+            new_phase = "Course Correction"
+        elif progress <= 85.0:
+            new_phase = "Scientific Operations"
+        elif progress <= 95.0:
+            new_phase = "Approach"
+        elif progress < 100.0:
+            new_phase = "Landing / Deployment"
+        else:
+            new_phase = "Completed"
+            
+        if new_phase != old_phase and old_phase != "Emergency":
+            self.state = new_phase
+            await self.log_event("INFO", f"Mission Phase transition: {old_phase} -> {new_phase}")
+            
+            # Update matching timeline checkpoint in database to COMPLETED
+            if connection.SessionLocal:
+                try:
+                    async with connection.SessionLocal() as db:
+                        stmt = update(MissionTimelineModel).where(MissionTimelineModel.phase == old_phase).values(status="COMPLETED")
+                        await db.execute(stmt)
+                        await db.commit()
+                except Exception as e:
+                    print(f"[Ops Center] Failed to update timeline record: {e}")
+                    
+            # Broadcast WS event
+            await manager.broadcast_json({
+                "type": "PHASE_UPDATED",
+                "phase": new_phase,
+                "message": f"Spacecraft entered {new_phase} segment."
+            })
+
+    async def trigger_autonomous_recovery(self):
+        # Prevent double recovery triggers
+        if hasattr(self, "_recovery_active") and self._recovery_active:
+            return
+            
+        self._recovery_active = True
+        await self.log_event("WARNING", "CRITICAL RISK DETECTED (>80%)! Initiating Autonomous Recovery Protocol.")
+        
+        # Broadcast WS event
+        await manager.broadcast_json({
+            "type": "RECOVERY_ACTIVATED",
+            "risk_score": round(self.risk_score, 1),
+            "message": "Ops Center activated self-recovery sequences."
+        })
+        
+        # 1. Evaluate strategies
+        # Standard conservative plan is usually the safest under critical risk
+        proposed = "Conservative"
+        details = "Shuts down primary thrusters, diverts solar grids to life support systems and armor magnetic deflectors."
+        
+        # 2. Select and execute recovery
+        old_risk = self.risk_score
+        
+        # Execute recovery corrections (resolve the active event or improve system health)
+        await asyncio.sleep(2.0)
+        
+        if self.active_events:
+            event_to_resolve = self.active_events[0]
+            await self.log_event("INFO", f"Recovery Plan selected: {proposed}. Resolving {event_to_resolve['event_type']} via emergency backup bypass.")
+            event_to_resolve["status"] = "MITIGATING"
+            event_to_resolve["mitigation_timer"] = 1.0 # fast resolve
+        else:
+            await self.log_event("INFO", f"Recovery Plan selected: {proposed}. Recharging solar grids.")
+            self.power = min(100.0, self.power + 30.0)
+            
+        # Re-evaluate risk
+        self.health = min(100.0, self.health + 15.0)
+        for sub in self.subsystems:
+            self.subsystems[sub]["health"] = min(100.0, self.subsystems[sub]["health"] + 15.0)
+            
+        # Write record to database RecoveryActionModel
+        if connection.SessionLocal:
+            from backend.database.models import RecoveryActionModel
+            try:
+                async with connection.SessionLocal() as db:
+                    rec = RecoveryActionModel(
+                        timestamp=datetime.utcnow(),
+                        initial_risk_score=old_risk,
+                        proposed_strategy=proposed,
+                        action_details=details,
+                        outcome_details="Hull Armor patched, subsystems rebooted, solar grids stabilized.",
+                        final_risk_score=round(self.risk_score * 0.5, 1), # half risk
+                        success=True
+                    )
+                    db.add(rec)
+                    await db.commit()
+            except Exception as e:
+                print(f"[Ops Center] Failed to log recovery action: {e}")
+                
+        await self.log_event("INFO", f"Autonomous Recovery completed. Risk mitigated to safe level.")
+        self._recovery_active = False
+
+    async def inject_anomaly(
+        self,
+        event_type: str,
+        severity: str = "HIGH",
+        duration: float = 30.0,
+        affected_system: str = None,
+        propagation_speed: float = 1.0,
+        probability: float = 1.0,
+        impact_multipliers: Dict[str, float] = None,
+        trigger_time: float = 0.0
+    ) -> int:
+        # Resolve affected system and desc from registry templates if not provided
+        tmpl = self.anomaly_templates.get(event_type, {})
+        system = affected_system or tmpl.get("affected_system", "Diagnostics")
+        desc = tmpl.get("desc", f"Manual anomaly alert: {event_type}")
+        rec_action = tmpl.get("action", "Perform systems sweep.")
+        
+        # Merge or default multipliers
+        mults = impact_multipliers or tmpl.get("multipliers", {})
+        
+        # Register standard action options on the fly if needed
+        if event_type not in self.action_options:
+            action_key_1 = f"{event_type.lower().replace(' ', '_')}_mitigate"
+            action_key_2 = f"{event_type.lower().replace(' ', '_')}_ignore"
+            self.action_options[event_type] = [
+                {"action_key": action_key_1, "action_name": "Initiate Standard Mitigation", "description": f"Perform standard recovery actions to address {event_type}."},
+                {"action_key": action_key_2, "action_name": "Ignore Threat", "description": "Observe and take no immediate action."}
+            ]
+            # Action predictions
+            fuel_d, power_d = 0.0, 0.0
+            for var, val in mults.items():
+                if var == "fuel":
+                    fuel_d = val * 2 - 2.0
+                elif var == "power":
+                    power_d = val * 2 - 2.0
+            self.action_predictions[action_key_1] = {
+                "fuel_delta": round(fuel_d, 1),
+                "power_delta": round(power_d, 1),
+                "risk_reduction": 80.0,
+                "success_delta": 10.0
+            }
+            self.action_predictions[action_key_2] = {
+                "fuel_delta": round(fuel_d * 5, 1),
+                "power_delta": round(power_d * 5, 1),
+                "risk_reduction": 0.0,
+                "success_delta": -15.0
+            }
+
+        db_event_id = None
+        if connection.SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    from backend.database.models import MissionEventModel
+                    db_event = MissionEventModel(
+                        event_type=event_type,
+                        severity=severity,
+                        timestamp=datetime.utcnow(),
+                        description=desc,
+                        affected_system=system,
+                        probability=probability,
+                        recommended_actions=rec_action,
+                        resolved=False
+                    )
+                    db.add(db_event)
+                    await db.flush()
+                    db_event_id = db_event.id
+                    await db.commit()
+            except Exception as e:
+                print(f"[DB ERROR] Manual injection save failed: {e}")
+
+        # Formulate root causes dynamically
+        root_causes = [desc]
+        
+        new_active_event = {
+            "id": db_event_id or random.randint(10000, 99999),
+            "event_type": event_type,
+            "severity": severity,
+            "description": desc,
+            "affected_system": system,
+            "recommended_actions": rec_action,
+            "duration": duration,
+            "status": "ACTIVE",
+            "mitigation_timer": 0.0,
+            "chosen_action": None,
+            "propagation_speed": propagation_speed,
+            "probability": probability,
+            "impact_multipliers": json.dumps(mults) if isinstance(mults, dict) else mults,
+            "trigger_time": trigger_time,
+            "root_causes": root_causes,
+            "selected_root_cause": root_causes[0]
+        }
+        
+        self.active_events.append(new_active_event)
+        
+        # Track recovery timings
+        now_ts = datetime.utcnow().timestamp()
+        self.recovery_start_times[new_active_event["id"]] = now_ts
+        self.recovery_initial_metrics[new_active_event["id"]] = {
+            "fuel": self.fuel,
+            "power": self.power,
+            "oxygen": self.oxygen,
+            "health": self.health,
+            "success_probability": self.success_probability,
+            "risk_score": self.risk_score
+        }
+
+        # Apply instant impact effects if any
+        for var, val in mults.items():
+            if var == "fuel" and val < 0:
+                self.fuel = max(0.0, self.fuel + val * 5.0)
+            elif var == "power" and val < 0:
+                self.power = max(10.0, self.power + val * 5.0)
+
+        # Broadcast WS event
+        await self.log_event(severity, f"ANOMALY INJECTED: {event_type} - {desc}")
+        await manager.broadcast_json({
+            "type": "NEW_EVENT",
+            "event": {
+                "id": new_active_event["id"],
+                "event_type": event_type,
+                "severity": severity,
+                "description": desc,
+                "affected_system": system,
+                "recommended_actions": rec_action,
+                "status": "ACTIVE"
+            }
+        })
+        
+        # Broadcast specifically for the Testing Center
+        await manager.broadcast_json({
+            "type": "Anomaly Injected",
+            "event_id": new_active_event["id"],
+            "event_type": event_type,
+            "severity": severity,
+            "system": system
+        })
+
+        redis = await get_redis()
+        await redis.set("hail_mary:active_events", json.dumps([
+            {k: v for k, v in ev.items() if k not in ["duration", "mitigation_timer"]} 
+            for ev in self.active_events
+        ]))
+        await redis.set("hail_mary:test:current_anomalies", json.dumps([e["event_type"] for e in self.active_events]))
+
+        # Update Trajectory Planner active events on manual/automatic injection
+        mapped_event = None
+        if event_type == "Fuel Leak":
+            mapped_event = "fuel_leak"
+        elif event_type == "Thruster Failure":
+            mapped_event = "thruster_failure"
+        elif event_type == "Navigation Drift":
+            mapped_event = "navigation_drift"
+
+        if mapped_event:
+            try:
+                from backend.trajectory.planner import TrajectoryPlanner
+                from backend.database.connection import SessionLocal
+                from backend.database.models import DestinationModel
+                from sqlalchemy import select
+
+                planner = await TrajectoryPlanner.load_from_redis()
+                if mapped_event not in planner.active_events:
+                    planner.active_events.append(mapped_event)
+                    await planner.save_to_redis()
+                    if SessionLocal:
+                        async with SessionLocal() as db_session:
+                            stmt = select(DestinationModel).where(DestinationModel.name == planner.destination)
+                            res_db = await db_session.execute(stmt)
+                            dest_row = res_db.scalars().first()
+                            if dest_row:
+                                outputs = planner.calculate(dest_row.avg_distance_km)
+                                await manager.broadcast_json({
+                                    "type": "TRAJECTORY_UPDATE",
+                                    "data": {
+                                        "inputs": planner.to_dict(),
+                                        "outputs": outputs
+                                    }
+                                })
+            except Exception as ex:
+                print(f"[Trajectory Hook Error] Failed to inject event in planner: {ex}")
+
+        return new_active_event["id"]
+
+    async def process_scenario_ticks(self, dt: float):
+        if not self.active_scenario:
+            return
+            
+        self.scenario_timer += dt
+        
+        # Trigger any timed events
+        untriggered = [ev for ev in self.active_scenario["events"] if ev["id"] not in self.scenario_triggered_events]
+        
+        for ev in untriggered:
+            if self.scenario_timer >= ev["trigger_time"]:
+                self.scenario_triggered_events.add(ev["id"])
+                
+                # Ingest event variables
+                mults = ev.get("impact_multipliers", {})
+                if isinstance(mults, str):
+                    try:
+                        mults = json.loads(mults)
+                    except:
+                        mults = {}
+                        
+                await self.inject_anomaly(
+                    event_type=ev["event_type"],
+                    severity=ev["severity"],
+                    duration=ev["duration"],
+                    affected_system=ev["affected_system"],
+                    propagation_speed=ev.get("propagation_speed", 1.0),
+                    probability=ev.get("probability", 1.0),
+                    impact_multipliers=mults,
+                    trigger_time=ev["trigger_time"]
+                )
+
+        # Check if all scenario events have finished and resolved
+        all_triggered = len(self.scenario_triggered_events) == len(self.active_scenario["events"])
+        no_active = len(self.active_events) == 0
+        
+        if all_triggered and no_active:
+            # Scenario completed!
+            scen_name = self.active_scenario["name"]
+            await self.log_event("INFO", f"TEST SCENARIO COMPLETED: {scen_name}. All systems stabilized.")
+            
+            # Save stress test benchmark summary
+            await self.save_benchmark_result(scen_name)
+            
+            # Broadcast scenario completed
+            await manager.broadcast_json({
+                "type": "Scenario Completed",
+                "scenario_name": scen_name,
+                "resilience_score": self.resilience_score
+            })
+            
+            # Clear active scenario
+            self.active_scenario = None
+
+    async def calculate_resilience_scores(self):
+        # Calculate Survivability
+        self.survivability_score = round(self.health, 1)
+        
+        # Calculate Adaptability
+        self.adaptability_score = round(max(0.0, 100.0 - self.risk_score), 1)
+        
+        # Calculate System Stability (100 - standard deviation of subsystems health)
+        import statistics
+        sub_healths = [s["health"] for s in self.subsystems.values()]
+        if len(sub_healths) > 1:
+            try:
+                std_dev = statistics.stdev(sub_healths)
+            except:
+                std_dev = 0.0
+            self.system_stability = round(max(0.0, 100.0 - std_dev), 1)
+        else:
+            self.system_stability = 100.0
+            
+        # Calculate overall resilience score
+        self.resilience_score = round(
+            0.30 * self.survivability_score +
+            0.30 * self.adaptability_score +
+            0.20 * self.recovery_efficiency +
+            0.20 * self.system_stability,
+            1
+        )
+        
+        # Save to DB ResilienceScoreModel
+        if connection.SessionLocal:
+            from backend.database.models import ResilienceScoreModel
+            rec = ResilienceScoreModel(
+                timestamp=datetime.utcnow(),
+                resilience_score=self.resilience_score,
+                adaptability_score=self.adaptability_score,
+                survivability_score=self.survivability_score,
+                recovery_efficiency=self.recovery_efficiency,
+                system_stability=self.system_stability,
+                overall_robustness=self.resilience_score
+            )
+            self.resilience_write_buffer.append(rec)
+                
+        # Cache in Redis
+        redis = await get_redis()
+        await redis.set("hail_mary:test:resilience_score", json.dumps({
+            "resilience": self.resilience_score,
+            "survivability": self.survivability_score,
+            "adaptability": self.adaptability_score,
+            "stability": self.system_stability,
+            "recovery_efficiency": self.recovery_efficiency
+        }))
+        
+        # Broadcast WS
+        await manager.broadcast_json({
+            "type": "Risk Updated",
+            "resilience_score": self.resilience_score,
+            "risk_score": self.risk_score
+        })
+
+    async def save_benchmark_result(self, scenario_name: str):
+        if not connection.SessionLocal:
+            return
+            
+        try:
+            async with connection.SessionLocal() as db:
+                from backend.database.models import BenchmarkResultModel, StressTestResultModel
+                
+                # Check active event names
+                events_list = [ev["event_type"] for ev in self.active_events] or ["Solar Storm", "Fuel Leak"]
+                injected = ", ".join(events_list)
+                
+                benchmark = BenchmarkResultModel(
+                    timestamp=datetime.utcnow(),
+                    scenario_name=scenario_name,
+                    injected_event=injected,
+                    subsystem_impact=json.dumps({k: v["health"] for k, v in self.subsystems.items()}),
+                    mission_impact=json.dumps({
+                        "fuel": self.fuel,
+                        "power": self.power,
+                        "oxygen": self.oxygen,
+                        "health": self.health,
+                        "success_probability": self.success_probability
+                    }),
+                    recovery_outcome="SUCCESS" if self.health > 40.0 else "CRITICAL_DAMAGE",
+                    risk_evolution=json.dumps([round(self.risk_score, 1)]),
+                    final_mission_state=self.state
+                )
+                db.add(benchmark)
+                
+                # Also save to stress test results
+                stress = StressTestResultModel(
+                    timestamp=datetime.utcnow(),
+                    scenario_name=scenario_name,
+                    num_events=len(events_list),
+                    average_success_prob=self.success_probability,
+                    average_risk=self.risk_score,
+                    average_resource_loss=round(100.0 - self.fuel, 1),
+                    average_recovery_time=15.0,  # mock avg recovery secs
+                    details_json=json.dumps({"resilience_score": self.resilience_score})
+                )
+                db.add(stress)
+                
+                await db.commit()
+                
+                # Broadcast WS
+                await manager.broadcast_json({
+                    "type": "Benchmark Updated",
+                    "scenario_name": scenario_name,
+                    "success_probability": self.success_probability
+                })
+        except Exception as e:
+            print(f"[DB ERROR] Benchmark save failed: {e}")
+
+    async def start_preset_scenario(self, idx: int):
+        presets = {
+            1: {
+                "name": "Solar Storm Emergency",
+                "desc": "Simultaneous solar storm CME grids discharge and secondary panels failure.",
+                "events": [
+                    {"event_type": "Solar Storm", "severity": "CRITICAL", "duration": 40.0, "affected_system": "Power", "trigger_time": 0.0, "impact_multipliers": {"power": -1.5, "subsystems.Power": -2.0}},
+                    {"event_type": "Power Failure", "severity": "HIGH", "duration": 30.0, "affected_system": "Power", "trigger_time": 5.0, "impact_multipliers": {"power": -2.0, "subsystems.Power": -3.0}}
+                ]
+            },
+            2: {
+                "name": "Deep Space Fuel Crisis",
+                "desc": "Compounded Port tank valves leak and main thrusters bypass failures.",
+                "events": [
+                    {"event_type": "Fuel Leak", "severity": "HIGH", "duration": 45.0, "affected_system": "Propulsion", "trigger_time": 0.0, "impact_multipliers": {"fuel": -0.8, "subsystems.Propulsion": -1.5}},
+                    {"event_type": "Thruster Failure", "severity": "HIGH", "duration": 35.0, "affected_system": "Propulsion", "trigger_time": 4.0, "impact_multipliers": {"subsystems.Propulsion": -3.0}}
+                ]
+            },
+            3: {
+                "name": "Communication Blackout",
+                "desc": "Total high gain antenna carrier synchronization loss and Earth station drops.",
+                "events": [
+                    {"event_type": "Communication Loss", "severity": "CRITICAL", "duration": 50.0, "affected_system": "Communication", "trigger_time": 0.0, "impact_multipliers": {"subsystems.Communication": -3.0}},
+                    {"event_type": "Signal Corruption", "severity": "HIGH", "duration": 30.0, "affected_system": "Communication", "trigger_time": 6.0, "impact_multipliers": {"subsystems.Communication": -1.5}}
+                ]
+            },
+            4: {
+                "name": "Navigation Failure",
+                "desc": "Asymmetrical IMU drift combined with optical star trackers shutter faults.",
+                "events": [
+                    {"event_type": "Navigation Drift", "severity": "HIGH", "duration": 40.0, "affected_system": "Navigation", "trigger_time": 0.0, "impact_multipliers": {"subsystems.Navigation": -2.0, "position_error": 0.5}},
+                    {"event_type": "Star Tracker Failure", "severity": "HIGH", "duration": 35.0, "affected_system": "Navigation", "trigger_time": 8.0, "impact_multipliers": {"subsystems.Navigation": -2.5, "position_error": 1.2}}
+                ]
+            },
+            5: {
+                "name": "Engine Catastrophic Failure",
+                "desc": "Complete main combustion chamber cut and RCS attitude alignment loss.",
+                "events": [
+                    {"event_type": "Engine Failure", "severity": "CATASTROPHIC", "duration": 60.0, "affected_system": "Propulsion", "trigger_time": 0.0, "impact_multipliers": {"velocity": -1.2, "subsystems.Propulsion": -5.0}},
+                    {"event_type": "Attitude Control Failure", "severity": "HIGH", "duration": 40.0, "affected_system": "Propulsion", "trigger_time": 5.0, "impact_multipliers": {"subsystems.Propulsion": -2.0, "position_error": 0.6}}
+                ]
+            },
+            6: {
+                "name": "Mars Landing Emergency",
+                "desc": "Attitude jets failures, structural pressure leaks during entry decelerations.",
+                "events": [
+                    {"event_type": "Attitude Control Failure", "severity": "HIGH", "duration": 30.0, "affected_system": "Propulsion", "trigger_time": 0.0, "impact_multipliers": {"subsystems.Propulsion": -2.5, "position_error": 0.8}},
+                    {"event_type": "Pressure Loss", "severity": "HIGH", "duration": 35.0, "affected_system": "Life Support", "trigger_time": 6.0, "impact_multipliers": {"oxygen": -2.0, "subsystems.Life Support": -3.0}}
+                ]
+            },
+            7: {
+                "name": "Life Support Crisis",
+                "desc": "Cabin seal blowouts, CO2 saturated filters, and O2 drops.",
+                "events": [
+                    {"event_type": "Life Support Failure", "severity": "CRITICAL", "duration": 45.0, "affected_system": "Life Support", "trigger_time": 0.0, "impact_multipliers": {"oxygen": -3.0, "subsystems.Life Support": -5.0}},
+                    {"event_type": "CO2 Filter Failure", "severity": "MEDIUM", "duration": 30.0, "affected_system": "Life Support", "trigger_time": 5.0, "impact_multipliers": {"oxygen": -1.0, "subsystems.Life Support": -1.5}}
+                ]
+            },
+            8: {
+                "name": "Perfect Storm",
+                "desc": "Extreme scenario triggering storm, comm loss, fuel leak, and navigation failures.",
+                "events": [
+                    {"event_type": "Solar Storm", "severity": "CRITICAL", "duration": 50.0, "affected_system": "Power", "trigger_time": 0.0, "impact_multipliers": {"power": -1.5, "subsystems.Power": -2.0}},
+                    {"event_type": "Communication Loss", "severity": "HIGH", "duration": 40.0, "affected_system": "Communication", "trigger_time": 4.0, "impact_multipliers": {"subsystems.Communication": -2.0}},
+                    {"event_type": "Fuel Leak", "severity": "HIGH", "duration": 45.0, "affected_system": "Propulsion", "trigger_time": 10.0, "impact_multipliers": {"fuel": -0.5, "subsystems.Propulsion": -1.5}},
+                    {"event_type": "Navigation Drift", "severity": "HIGH", "duration": 30.0, "affected_system": "Navigation", "trigger_time": 15.0, "impact_multipliers": {"subsystems.Navigation": -1.5, "position_error": 0.5}}
+                ]
+            },
+            9: {
+                "name": "Total Systems Failure",
+                "desc": "Catastrophic cascade degrading all 7 onboard subsystems health metrics.",
+                "events": [
+                    {"event_type": "Power Failure", "severity": "CATASTROPHIC", "duration": 50.0, "affected_system": "Power", "trigger_time": 0.0, "impact_multipliers": {"power": -2.0, "subsystems.Power": -4.0}},
+                    {"event_type": "Life Support Failure", "severity": "CATASTROPHIC", "duration": 50.0, "affected_system": "Life Support", "trigger_time": 2.0, "impact_multipliers": {"oxygen": -2.5, "subsystems.Life Support": -4.0}},
+                    {"event_type": "Engine Failure", "severity": "CATASTROPHIC", "duration": 50.0, "affected_system": "Propulsion", "trigger_time": 4.0, "impact_multipliers": {"velocity": -1.0, "subsystems.Propulsion": -4.0}}
+                ]
+            },
+            10: {
+                "name": "Judge Demo Showcase",
+                "desc": "Sequential Solar Storm, Comm Loss, and Meteorite Impact optimized for demo evaluations.",
+                "events": [
+                    {"event_type": "Solar Storm", "severity": "HIGH", "duration": 30.0, "affected_system": "Power", "trigger_time": 0.0, "impact_multipliers": {"power": -1.2, "subsystems.Power": -1.5}},
+                    {"event_type": "Communication Loss", "severity": "HIGH", "duration": 30.0, "affected_system": "Communication", "trigger_time": 8.0, "impact_multipliers": {"subsystems.Communication": -1.5}},
+                    {"event_type": "Micrometeorite Impact", "severity": "HIGH", "duration": 30.0, "affected_system": "Thermal Control", "trigger_time": 16.0, "impact_multipliers": {"health": -0.8, "subsystems.Thermal Control": -2.5}}
+                ]
+            }
+        }
+        
+        scen = presets.get(idx)
+        if not scen:
+            return
+            
+        self.active_events = []
+        
+        db_scen_id = None
+        if connection.SessionLocal:
+            try:
+                async with connection.SessionLocal() as db:
+                    from backend.database.models import TestScenarioModel, ScenarioEventModel
+                    db_scen = TestScenarioModel(
+                        name=scen["name"],
+                        description=scen["desc"],
+                        is_custom=False,
+                        created_at=datetime.utcnow()
+                    )
+                    db.add(db_scen)
+                    await db.flush()
+                    db_scen_id = db_scen.id
+                    
+                    for index, ev in enumerate(scen["events"]):
+                        db_ev = ScenarioEventModel(
+                            scenario_id=db_scen_id,
+                            event_type=ev["event_type"],
+                            severity=ev["severity"],
+                            duration=ev["duration"],
+                            affected_system=ev["affected_system"],
+                            propagation_speed=1.0,
+                            probability=1.0,
+                            impact_multipliers=json.dumps(ev["impact_multipliers"]),
+                            trigger_time=ev["trigger_time"]
+                        )
+                        db.add(db_ev)
+                        
+                    await db.commit()
+            except Exception as e:
+                print(f"[DB ERROR] Save scenario preset failed: {e}")
+
+        events_parsed = []
+        for index, ev in enumerate(scen["events"]):
+            events_parsed.append({
+                "id": index + 1,
+                "event_type": ev["event_type"],
+                "severity": ev["severity"],
+                "duration": ev["duration"],
+                "affected_system": ev["affected_system"],
+                "propagation_speed": 1.0,
+                "probability": 1.0,
+                "impact_multipliers": ev["impact_multipliers"],
+                "trigger_time": ev["trigger_time"]
+            })
+            
+        self.active_scenario = {
+            "id": db_scen_id or random.randint(1000, 9999),
+            "name": scen["name"],
+            "desc": scen["desc"],
+            "events": events_parsed
+        }
+        self.scenario_timer = 0.0
+        self.scenario_triggered_events = set()
+        self.recovery_efficiency = 100.0
+        self.recovery_start_times = {}
+        self.recovery_mitigate_times = {}
+        self.recovery_initial_metrics = {}
+        
+        await self.log_event("INFO", f"TEST SCENARIO STARTED: {scen['name']} - {scen['desc']}")
+        
+        await manager.broadcast_json({
+            "type": "Scenario Started",
+            "scenario_name": scen["name"],
+            "description": scen["desc"],
+            "num_events": len(events_parsed)
+        })
+        
+        try:
+            redis = await get_redis()
+            await redis.set("hail_mary:test:active_scenario", json.dumps({
+                "id": self.active_scenario["id"],
+                "name": scen["name"],
+                "desc": scen["desc"],
+                "timer": 0.0
+            }))
+        except Exception as e:
+            print(f"[Redis ERROR] Caching active scenario failed: {e}")
 
 # Global Simulator instance
 simulator = SpacecraftSimulator()
